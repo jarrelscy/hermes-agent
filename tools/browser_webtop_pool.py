@@ -114,10 +114,14 @@ def _config_root() -> Path:
 
 
 def _image() -> str:
-    return os.environ.get(
-        "HERMES_WEBTOP_POOL_IMAGE",
-        "lscr.io/linuxserver/webtop:ubuntu-xfce",
-    ).strip() or "lscr.io/linuxserver/webtop:ubuntu-xfce"
+    # KasmVNC webtop (Xvnc) — its X11 framebuffer is real and XGetImage-able, so
+    # cua-driver desktop screenshots work. The Selkies webtop (ubuntu-xfce)
+    # renders to GPU pixmaps via pixelflux; XGetImage reads a black framebuffer
+    # there (even xsetroot is black), so computer_use captures were all black.
+    # Env is unreliable (Hermes scrubs os.environ at runtime), so the CODE
+    # DEFAULT governs — same as _prewarm_on_start.
+    _default = "lscr.io/linuxserver/webtop:ubuntu-xfce-kasm"
+    return os.environ.get("HERMES_WEBTOP_POOL_IMAGE", _default).strip() or _default
 
 
 # ── Kasada prewarm config ───────────────────────────────────────────────────
