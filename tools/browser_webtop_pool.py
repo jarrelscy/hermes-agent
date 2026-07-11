@@ -143,8 +143,12 @@ def _prewarm_on_start() -> bool:
     # first navigate to a Kasada domain via ensure_warm() (kill+relaunch+mint
     # with the no-CDP window, THEN navigate on the warm cookie). Non-Kasada
     # sites (e.g. the realestate cron scrapes domain.com.au) never mint at all.
-    # Set HERMES_WEBTOP_POOL_KASADA_PREWARM_ON_START=1 to force eager.
-    return _bool_env("HERMES_WEBTOP_POOL_KASADA_PREWARM_ON_START", False)
+    # Now that the eager mint runs in a background daemon (non-blocking —
+    # get_cdp_url returns immediately, the mint proceeds off the create path and
+    # ensure_warm coordinates via _warm_lock), eager is the default so a fresh
+    # container is minting its KP_UIDz before the agent's first navigate.
+    # Set HERMES_WEBTOP_POOL_KASADA_PREWARM_ON_START=0 to force lazy.
+    return _bool_env("HERMES_WEBTOP_POOL_KASADA_PREWARM_ON_START", True)
 
 
 def _apex(domain: str) -> str:
@@ -1041,17 +1045,23 @@ def _create_container(entry: Dict) -> None:
     entry["running"] = True
     _save_state()
     if do_prewarm:
-        # Eager Kasada mint (only when PREWARM_ON_START=1). Best-effort and
-        # NON-FATAL: a failed/slow mint must never discard the container. Lazy
-        # mode (default) skips this and mints on the first protected navigate
-        # via ensure_warm(). Sequential — parallel mints collide on chrome.
-        try:
-            _prewarm_kasada(entry, domains[0], relaunch=False)
-            for d in domains[1:]:
-                _prewarm_kasada(entry, d, relaunch=True)
-        except Exception as e:
-            logger.warning("webtop pool: eager prewarm for %s failed (non-fatal): %s",
-                           name, e)
+        # Eager Kasada mint, NON-BLOCKING: chrome was already launched above
+        # with domains[0] as its startup URL (its own first nav mints under the
+        # no-CDP window). Run the wait+verify in a background daemon so
+        # get_cdp_url() returns immediately (fast cold-start). _prewarm_kasada
+        # serializes per-container via _warm_lock and is idempotent, so the
+        # first protected navigate's ensure_warm() just waits on the same lock
+        # and no-ops once this mint lands. Best-effort + NON-FATAL.
+        def _eager_mint(_entry=entry, _domains=list(domains), _name=name):
+            try:
+                _prewarm_kasada(_entry, _domains[0], relaunch=False)
+                for d in _domains[1:]:
+                    _prewarm_kasada(_entry, d, relaunch=True)
+            except Exception as e:
+                logger.warning("webtop pool: eager prewarm for %s failed (non-fatal): %s",
+                               _name, e)
+        threading.Thread(target=_eager_mint, name="kasada-prewarm-" + str(name),
+                         daemon=True).start()
 
 
 def _stop_and_remove(entry: Dict, remove: bool = True) -> None:
