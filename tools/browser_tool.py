@@ -469,7 +469,21 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            raw_cfg = str(browser_cfg.get("cdp_url", "") or "")
+            # When the webtop pool is enabled, the global browser.cdp_url is
+            # vestigial: CDP is routed per task_id via the pool, and nothing
+            # listens on the shared config port. Return it unresolved so the
+            # CDP-mode guards (_is_local_mode etc.) stay truthy, but skip the
+            # /json/version probe that otherwise logs a connection-refused
+            # WARNING on every call. Non-pool setups keep the resolving probe.
+            if raw_cfg:
+                try:
+                    from tools.browser_webtop_pool import pool_enabled as _pool_enabled
+                    if _pool_enabled():
+                        return raw_cfg
+                except Exception:
+                    pass
+            return _resolve_cdp_override(raw_cfg)
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
