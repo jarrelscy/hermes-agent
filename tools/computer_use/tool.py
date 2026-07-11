@@ -175,6 +175,15 @@ def _get_backend(task_id: Optional[str] = None) -> ComputerUseBackend:
         try:
             from tools.browser_webtop_pool import pool_enabled, get_container_name
             if pool_enabled():
+                # Ensure the task's webtop container is created + running so the
+                # docker-exec cua-driver binds to a live X server. A thread's
+                # first action may be computer_use (before any browser use), so
+                # we cannot assume the container already exists. Idempotent.
+                try:
+                    from tools.browser_webtop_pool import _ensure_running
+                    _ensure_running(task_id)
+                except Exception:
+                    pass
                 container = get_container_name(task_id)
         except Exception:
             container = None
@@ -975,18 +984,23 @@ def check_computer_use_requirements() -> bool:
     """
     if sys.platform not in ("darwin", "win32", "linux"):
         return False
-    from tools.computer_use.cua_backend import cua_driver_binary_available
-    if not cua_driver_binary_available():
-        return False
+    # Phase 2b: with the per-thread webtop pool enabled, cua-driver runs INSIDE
+    # each container (docker exec /config/bin/cua-driver mcp), so the HOST
+    # binary is NOT required. Check the pool BEFORE the host-binary gate below,
+    # else a headless host with no host-side cua-driver gates the tool off even
+    # though every task has a working in-container display + driver.
     if sys.platform == "linux":
-        # Need a reachable display. The pool gives one per-task (inside each
-        # webtop container); otherwise the host must have DISPLAY itself.
         try:
             from tools.browser_webtop_pool import pool_enabled
             if pool_enabled():
                 return True
         except Exception:
             pass
+    from tools.computer_use.cua_backend import cua_driver_binary_available
+    if not cua_driver_binary_available():
+        return False
+    if sys.platform == "linux":
+        # Non-pool Linux: the host itself must have a reachable display.
         return bool(os.environ.get("DISPLAY", "").strip())
     return True
 
