@@ -531,7 +531,14 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     the browser session itself.  The agent simply won't see
     ``pending_dialogs`` / ``frame_tree`` fields in snapshots.
     """
-    cdp_url = _get_cdp_override()
+    cdp_url = ""
+    try:
+        from tools.browser_webtop_pool import get_cdp_url as _pool_cdp_url
+        cdp_url = _pool_cdp_url(task_id) or ""
+    except Exception:
+        pass
+    if not cdp_url:
+        cdp_url = _get_cdp_override()
     if not cdp_url:
         # Fallback: active session may carry a per-session CDP URL from a
         # cloud provider (Browserbase sets this).
@@ -2036,7 +2043,18 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     force_local = _is_local_sidecar_key(task_id)
 
     # Create session outside the lock (network call in cloud mode)
-    cdp_override = _get_cdp_override()
+    # Per-thread webtop pool: when enabled, each task_id gets its own
+    # webtop container + chromium, routed via a dedicated CDP host port.
+    # Falls back to the single global browser.cdp_url when the pool is off
+    # (Phase 1 shared-desktop behaviour).
+    cdp_override = ""
+    try:
+        from tools.browser_webtop_pool import get_cdp_url as _pool_cdp_url
+        cdp_override = _pool_cdp_url(task_id) or ""
+    except Exception as _e:  # module missing / docker unavailable
+        logger.debug("webtop pool unavailable, using global cdp_url: %s", _e)
+    if not cdp_override:
+        cdp_override = _get_cdp_override()
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
@@ -2806,6 +2824,20 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     if is_first_nav:
         session_info["_first_nav"] = False
         _maybe_start_recording(nav_session_key)
+
+    # Per-thread webtop pool: mint a Kasada KP_UIDz cookie for protected hosts
+    # before the actual navigate so the page short-circuits the challenge
+    # (warm cookie -> real homepage in ~3s). Non-blocking on failure: a mint
+    # error never stops the navigate; the agent can re-mint manually via the
+    # mnemosyne kasada-warmup procedure if it ever sees the KPSDK bootstrap.
+    # Cheap no-op for non-Kasada hosts (ensure_warm returns True immediately).
+    try:
+        _kp_host = urllib.parse.urlparse(url).hostname or ""
+        if _kp_host:
+            from tools.browser_webtop_pool import ensure_warm as _pool_ensure_warm
+            _pool_ensure_warm(nav_session_key, _kp_host, timeout=120.0)
+    except Exception as _e:
+        logger.debug("browser_navigate: kasada ensure_warm skipped: %s", _e)
 
     result = _run_browser_command(
         nav_session_key,
@@ -4235,6 +4267,31 @@ def _cleanup_old_recordings(max_age_hours=72):
 # ============================================================================
 # Cleanup and Management Functions
 # ============================================================================
+
+def delete_pool_containers(task_id: Optional[str]) -> None:
+    """Permanently remove a task's webtop pool container(s) AND their /config
+    volume, on THREAD/SESSION DELETION (db.delete_session).  NOT called on
+    transient teardown (WS disconnect / idle / restart) — those keep the
+    per-thread webtop + its warm profile alive so the thread resumes ready.
+    Covers the bare task key and its ``::local`` sidecar.  No-op when the pool
+    is disabled.
+    """
+    if task_id is None:
+        return
+    try:
+        from tools.browser_webtop_pool import (
+            delete_task as _pool_delete,
+            pool_enabled as _pool_enabled,
+        )
+        if not _pool_enabled():
+            return
+        _pool_delete(task_id)
+        sidecar = f"{task_id}{_LOCAL_SUFFIX}"
+        if sidecar != task_id:
+            _pool_delete(sidecar)
+    except Exception as e:
+        logger.debug("delete_pool_containers(%s): %s", task_id, e)
+
 
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """

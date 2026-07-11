@@ -139,33 +139,92 @@ def _is_blocked_type(text: str) -> Optional[str]:
 # Per-process cached backend; lazily instantiated on first call.
 _backend_lock = threading.Lock()
 _backend: Optional[ComputerUseBackend] = None
+# Phase 2b: per-task backends for the per-thread webtop container model.
+# Each task_id gets its own CuaDriverBackend bound to its container's X
+# server (docker exec ... cua-driver mcp). LRU-capped to the pool size.
+_backends: Dict[str, ComputerUseBackend] = {}
+_backends_lru: List[str] = []
+_BACKEND_MAX = 16
 # Session-scoped approval state.
 _session_auto_approve = False
 _always_allow: set = set()  # action names the user unlocked for the session
 
 
-def _get_backend() -> ComputerUseBackend:
+def _get_backend(task_id: Optional[str] = None) -> ComputerUseBackend:
+    """Return a computer-use backend, per-task when the webtop pool is on.
+
+    Phase 2b: when ``HERMES_WEBTOP_POOL`` is enabled, each task_id gets its
+    own ``CuaDriverBackend`` bound to its webtop container's X server
+    (cua-driver spawned via ``docker exec -i <container> … mcp``), giving
+    per-thread isolated OS-level keyboard/mouse. When the pool is off,
+    falls back to the legacy process-global singleton (host-spawned
+    cua-driver — only works if the host has a display).
+    """
     global _backend
-    with _backend_lock:
-        if _backend is None:
-            backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "cua").lower()
-            if backend_name in {"cua", "cua-driver", ""}:
-                from tools.computer_use.cua_backend import CuaDriverBackend
-                _backend = CuaDriverBackend()
-            elif backend_name == "noop":  # pragma: no cover
+    backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "cua").lower()
+    if backend_name == "noop":  # pragma: no cover
+        with _backend_lock:
+            if _backend is None:
                 _backend = _NoopBackend()
-            else:
-                raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
-            try:
                 _backend.start()
-            except Exception:
-                # Don't cache a backend whose start() failed (e.g. a lazy
-                # dependency install was declined / failed). The next call
-                # retries cleanly instead of returning a half-initialised
-                # backend.
-                _backend = None
-                raise
-        return _backend
+            return _backend
+
+    # Per-task container backend?
+    container = None
+    if task_id:
+        try:
+            from tools.browser_webtop_pool import pool_enabled, get_container_name
+            if pool_enabled():
+                container = get_container_name(task_id)
+        except Exception:
+            container = None
+
+    if not container:
+        # Legacy singleton path (no pool / no container for this task).
+        with _backend_lock:
+            if _backend is None:
+                if backend_name in {"cua", "cua-driver", ""}:
+                    from tools.computer_use.cua_backend import CuaDriverBackend
+                    _backend = CuaDriverBackend()
+                else:
+                    raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
+                try:
+                    _backend.start()
+                except Exception:
+                    _backend = None
+                    raise
+            return _backend
+
+    # Per-task backend, LRU-capped.
+    with _backend_lock:
+        b = _backends.get(task_id)
+        if b is not None:
+            # bump LRU
+            try:
+                _backends_lru.remove(task_id)
+                _backends_lru.append(task_id)
+            except ValueError:
+                _backends_lru.append(task_id)
+            return b
+        # create new
+        from tools.computer_use.cua_backend import CuaDriverBackend
+        b = CuaDriverBackend(container=container)
+        # evict oldest if at cap
+        while len(_backends) >= _BACKEND_MAX and _backends_lru:
+            old = _backends_lru.pop(0)
+            ob = _backends.pop(old, None)
+            if ob is not None:
+                try:
+                    ob.stop()
+                except Exception:
+                    pass
+        try:
+            b.start()
+        except Exception:
+            raise
+        _backends[task_id] = b
+        _backends_lru.append(task_id)
+        return b
 
 
 def reset_backend_for_tests() -> None:  # pragma: no cover
@@ -271,9 +330,11 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         if err is not None:
             return err
 
-    # Dispatch to backend.
+    # Dispatch to backend. Phase 2b: route to the per-task container backend
+    # when the webtop pool is enabled (task_id arrives via the registry kwargs).
+    task_id = kwargs.get("task_id")
     try:
-        backend = _get_backend()
+        backend = _get_backend(task_id)
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
@@ -905,11 +966,29 @@ def check_computer_use_requirements() -> bool:
     upstream. Linux users see specific blocked checks via
     `hermes computer-use doctor` if their session is incomplete (e.g. no
     DISPLAY set).
+
+    Phase 2b: on a headless Linux host, cua-driver has no display to connect
+    to, so the tool is gated OFF unless the per-thread webtop pool is enabled
+    (each task then gets its own container display via docker-exec). This
+    prevents exposing a non-functional tool that misleads the model into
+    thrashing. On macOS/Windows the host always has a session.
     """
     if sys.platform not in ("darwin", "win32", "linux"):
         return False
     from tools.computer_use.cua_backend import cua_driver_binary_available
-    return cua_driver_binary_available()
+    if not cua_driver_binary_available():
+        return False
+    if sys.platform == "linux":
+        # Need a reachable display. The pool gives one per-task (inside each
+        # webtop container); otherwise the host must have DISPLAY itself.
+        try:
+            from tools.browser_webtop_pool import pool_enabled
+            if pool_enabled():
+                return True
+        except Exception:
+            pass
+        return bool(os.environ.get("DISPLAY", "").strip())
+    return True
 
 
 def get_computer_use_schema() -> Dict[str, Any]:

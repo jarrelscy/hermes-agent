@@ -560,8 +560,14 @@ class _CuaDriverSession:
     session object, never the surrounding contexts.
     """
 
-    def __init__(self, bridge: _AsyncBridge) -> None:
+    def __init__(self, bridge: _AsyncBridge, container: Optional[str] = None) -> None:
         self._bridge = bridge
+        # Per-thread webtop container (Phase 2b). When set, cua-driver is
+        # spawned via `docker exec -i <container> ... cua-driver mcp` so it
+        # connects to that container's own X server (DISPLAY=:1) — giving
+        # per-thread isolated OS-level keyboard/mouse. None = host spawn
+        # (legacy single-display behaviour).
+        self._container = container
         self._session = None
         self._lock = threading.Lock()
         self._started = False
@@ -614,14 +620,34 @@ class _CuaDriverSession:
             # the MCP server, instead of hardcoding ["mcp"]. Falls back
             # transparently for older drivers / any discovery failure.
             self._startup_phase = "manifest-discovery"
-            command, args = _resolve_mcp_invocation(_CUA_DRIVER_CMD)
+            if self._container:
+                # Phase 2b: run cua-driver INSIDE the per-thread webtop
+                # container so it binds to that container's own X server
+                # (DISPLAY=:1). The binary is copied into /config/bin by
+                # the pool (persists across container recreates via the
+                # /config bind mount). We hardcode ["mcp"] (0.7.1 supports
+                # it) to avoid running `manifest` on the host, which would
+                # resolve to the host binary path (wrong inside container).
+                command = "docker"
+                args = [
+                    "exec", "-i", self._container,
+                    "env", "DISPLAY=:1", "HOME=/config",
+                    "/config/bin/cua-driver", "mcp",
+                ]
+                # docker exec inherits the spawned process env; keep it
+                # minimal + sanitized so no provider keys leak into the
+                # container. DISPLAY/HOME are set explicitly via `env`.
+                spawn_env = _sanitize_subprocess_env(cua_driver_child_env())
+            else:
+                command, args = _resolve_mcp_invocation(_CUA_DRIVER_CMD)
+                spawn_env = _sanitize_subprocess_env(cua_driver_child_env())
             _t_manifest = _time.monotonic()
             params = StdioServerParameters(
                 command=command,
                 args=args,
                 # Apply the telemetry policy first (default: disabled), then
                 # sanitize Hermes-managed secrets out of the child env.
-                env=_sanitize_subprocess_env(cua_driver_child_env()),
+                env=spawn_env,
             )
 
             async with stdio_client(params) as (read, write):
@@ -907,11 +933,36 @@ class _CuaDriverSession:
         call_args = dict(args)
         shot_file: Optional[str] = None
         if name == "get_window_state" and "screenshot_out_file" not in call_args:
-            fd, shot_file = _tempfile.mkstemp(prefix="cua_shot_", suffix=".png")
-            os.close(fd)
+            if self._container:
+                # Phase 2b: cua-driver runs inside the container, so the
+                # screenshot path must be container-visible. /config is the
+                # bind-mounted persistent volume (host == container path).
+                import uuid as _uuid
+                shot_file = f"/config/.cua-shots/{_uuid.uuid4().hex}.png"
+                # Ensure the dir exists inside the container.
+                try:
+                    import subprocess as _s
+                    _s.run(["docker", "exec", self._container, "mkdir", "-p",
+                             "/config/.cua-shots"], timeout=10,
+                            capture_output=True)
+                except Exception:
+                    pass
+            else:
+                fd, shot_file = _tempfile.mkstemp(prefix="cua_shot_", suffix=".png")
+                os.close(fd)
             call_args["screenshot_out_file"] = shot_file
 
-        cmd = [_CUA_DRIVER_CMD, "call", name, json.dumps(call_args)]
+        if self._container:
+            # Phase 2b: run the one-shot CLI fallback inside the container too.
+            cmd = [
+                "docker", "exec", self._container,
+                "env", "DISPLAY=:1", "HOME=/config",
+                "/config/bin/cua-driver", "call", name, json.dumps(call_args),
+            ]
+            cli_env = _sanitize_subprocess_env(cua_driver_child_env())
+        else:
+            cmd = [_CUA_DRIVER_CMD, "call", name, json.dumps(call_args)]
+            cli_env = _sanitize_subprocess_env(cua_driver_child_env())
         attempts = 4
         backoff = 0.5
         parsed: Any = None
@@ -921,7 +972,7 @@ class _CuaDriverSession:
                 try:
                     proc = _subprocess.run(
                         cmd, capture_output=True, text=True, timeout=max(15.0, timeout),
-                        env=_sanitize_subprocess_env(cua_driver_child_env()),
+                        env=cli_env,
                     )
                 except Exception as e:  # pragma: no cover - subprocess spawn failure
                     raise RuntimeError(f"cua-driver CLI fallback for {name} failed to spawn: {e}") from e
@@ -965,10 +1016,21 @@ class _CuaDriverSession:
                 if not shot:
                     # Screenshot was routed to a file (ours or the daemon's choice).
                     fpath = parsed.get("screenshot_file_path") or shot_file
-                    if fpath and os.path.exists(fpath):
+                    if fpath:
                         try:
-                            with open(fpath, "rb") as fh:
-                                shot = base64.b64encode(fh.read()).decode("ascii")
+                            if self._container:
+                                # Phase 2b: file lives inside the container;
+                                # read it back via docker exec cat.
+                                import subprocess as _s
+                                r = _s.run(
+                                    ["docker", "exec", self._container, "cat", fpath],
+                                    capture_output=True, timeout=15,
+                                )
+                                if r.returncode == 0 and r.stdout:
+                                    shot = base64.b64encode(r.stdout).decode("ascii")
+                            elif os.path.exists(fpath):
+                                with open(fpath, "rb") as fh:
+                                    shot = base64.b64encode(fh.read()).decode("ascii")
                         except Exception as e:
                             logger.debug("cua-driver CLI fallback: failed reading %s: %s", fpath, e)
                 if shot:
@@ -980,9 +1042,14 @@ class _CuaDriverSession:
                     data = f"{summary}\n{tree}" if summary else tree
             return {"data": data, "images": images, "structuredContent": structured, "isError": False}
         finally:
-            if shot_file and os.path.exists(shot_file):
+            if shot_file:
                 try:
-                    os.remove(shot_file)
+                    if self._container:
+                        import subprocess as _s
+                        _s.run(["docker", "exec", self._container, "rm", "-f", shot_file],
+                               capture_output=True, timeout=10)
+                    elif os.path.exists(shot_file):
+                        os.remove(shot_file)
                 except OSError:
                     pass
 
@@ -1151,9 +1218,12 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 class CuaDriverBackend(ComputerUseBackend):
     """Default computer-use backend. Cross-platform via cua-driver MCP."""
 
-    def __init__(self) -> None:
+    def __init__(self, container: Optional[str] = None) -> None:
+        # Phase 2b: when `container` is set, cua-driver runs inside that
+        # webtop container (per-thread isolated display). None = host spawn.
+        self._container = container
         self._bridge = _AsyncBridge()
-        self._session = _CuaDriverSession(self._bridge)
+        self._session = _CuaDriverSession(self._bridge, container=container)
         # Sticky context — updated by capture(), used by action tools.
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None

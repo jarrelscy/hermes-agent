@@ -1806,6 +1806,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = self._ensure_session_db()
         deleted = db.delete_session(session_id)
+        try:
+            from tools.browser_tool import delete_pool_containers
+            delete_pool_containers(session_id)
+        except Exception:
+            pass
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":

@@ -1050,6 +1050,19 @@ class TelegramAdapter(BasePlatformAdapter):
         db = getattr(store, "_db", None)
         if db is None or not hasattr(db, "delete_telegram_topic_binding"):
             return
+        # Resolve the session bound to this topic BEFORE deleting the
+        # binding, so a confirmed topic-deletion also reaps the thread's
+        # webtop (the binding row carries the session_id; delete cascades).
+        _reap_session_id = None
+        try:
+            if hasattr(db, "get_telegram_topic_binding"):
+                _b = db.get_telegram_topic_binding(
+                    chat_id=str(chat_id), thread_id=str(thread_id),
+                )
+                if _b:
+                    _reap_session_id = _b.get("session_id")
+        except Exception:
+            _reap_session_id = None
         try:
             removed = db.delete_telegram_topic_binding(
                 chat_id=str(chat_id), thread_id=str(thread_id),
@@ -1067,6 +1080,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 "chat=%s thread=%s (Bot API: thread not found)",
                 self.name, chat_id, thread_id,
             )
+            # The topic is gone from Telegram -> tear down its per-thread
+            # webtop (container + profile volume). Best-effort; never break
+            # the send-fallback path.
+            if _reap_session_id:
+                try:
+                    from tools.browser_tool import delete_pool_containers
+                    delete_pool_containers(_reap_session_id)
+                    logger.info(
+                        "[%s] Reaped webtop for deleted Telegram topic "
+                        "(session=%s)", self.name, _reap_session_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[%s] webtop reap for deleted topic session %s "
+                        "failed", self.name, _reap_session_id,
+                        exc_info=True,
+                    )
 
     @staticmethod
     def _is_bad_request_error(error: Exception) -> bool:
@@ -2904,6 +2934,98 @@ class TelegramAdapter(BasePlatformAdapter):
         self._post_connect_task = asyncio.ensure_future(
             self._run_post_connect_housekeeping()
         )
+        self._start_webtop_topic_reaper()
+
+    def _start_webtop_topic_reaper(self) -> None:
+        """Kick off the background sweep that reaps webtops whose Telegram DM
+        topic the user deleted. Telegram pushes no topic-deleted event, so we
+        poll. Idempotent."""
+        task = getattr(self, "_webtop_reaper_task", None)
+        if task and not task.done():
+            return
+        self._webtop_reaper_task = asyncio.ensure_future(
+            self._run_webtop_topic_reaper()
+        )
+
+    async def _run_webtop_topic_reaper(self) -> None:
+        """Periodically detect Telegram DM topics the user deleted and reap the
+        per-thread webtop bound to each. Telegram sends bots no topic-deleted
+        event, so for each IDLE running webtop bound to a DM topic we probe the
+        topic with a thread-scoped typing action; Bot API 'thread not found'
+        means the topic is gone -> reap via the same _prune chokepoint used on
+        the send path. Active webtops are skipped (the send-path prune covers
+        them). Tunables: HERMES_WEBTOP_TOPIC_REAP_INTERVAL (s, default 600;
+        <=0 disables), HERMES_WEBTOP_TOPIC_REAP_IDLE_GRACE (s, default 300)."""
+        import os
+        import time as _time
+        try:
+            interval = float(os.environ.get("HERMES_WEBTOP_TOPIC_REAP_INTERVAL", "600"))
+            grace = float(os.environ.get("HERMES_WEBTOP_TOPIC_REAP_IDLE_GRACE", "300"))
+        except (TypeError, ValueError):
+            interval, grace = 600.0, 300.0
+        if interval <= 0:
+            return
+        try:
+            import tools.browser_webtop_pool as _pool
+        except Exception:
+            return
+        logger.info("[%s] webtop topic-reaper started (interval=%ss grace=%ss)",
+                    self.name, int(interval), int(grace))
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if not _pool.pool_enabled() or not self._bot:
+                    continue
+                store = getattr(self, "_session_store", None)
+                db = getattr(store, "_db", None) if store else None
+                if db is None or not hasattr(db, "get_telegram_topic_binding_by_session"):
+                    continue
+                now = _time.time()
+                try:
+                    tasks = _pool.status().get("tasks", {})
+                except Exception:
+                    continue
+                for sid, info in list(tasks.items()):
+                    if not info.get("running"):
+                        continue
+                    if (now - float(info.get("last_used", 0) or 0)) < grace:
+                        continue  # active-ish; send-path prune covers it
+                    try:
+                        binding = db.get_telegram_topic_binding_by_session(session_id=sid)
+                    except Exception:
+                        binding = None
+                    if not binding:
+                        continue
+                    chat_id = binding.get("chat_id")
+                    thread_id = binding.get("thread_id")
+                    if not chat_id or not thread_id:
+                        continue
+                    try:
+                        await self._bot.send_chat_action(
+                            chat_id=normalize_telegram_chat_id(chat_id),
+                            action="typing",
+                            message_thread_id=int(thread_id),
+                        )
+                    except Exception as probe_err:
+                        if self._is_thread_not_found_error(probe_err):
+                            logger.info(
+                                "[%s] webtop topic-reaper: topic gone chat=%s "
+                                "thread=%s -> reaping session %s",
+                                self.name, chat_id, thread_id, sid,
+                            )
+                            # prune+reap is blocking (docker stop/rm/purge);
+                            # run off the event loop so polling isn't stalled.
+                            await loop.run_in_executor(
+                                None, self._prune_stale_dm_topic_binding,
+                                str(chat_id), str(thread_id),
+                            )
+                        # other probe errors (network / 429): skip this cycle
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("[%s] webtop topic-reaper cycle error",
+                             self.name, exc_info=True)
 
     async def _run_post_connect_housekeeping(self) -> None:
         """Register the command menu, surface the status indicator, and set up
@@ -3439,6 +3561,7 @@ class TelegramAdapter(BasePlatformAdapter):
         for task in list(self._pending_text_batch_tasks.values()):
             collect(task)
         collect(self._polling_error_task)
+        collect(getattr(self, "_webtop_reaper_task", None))
 
         for task in pending_tasks:
             task.cancel()

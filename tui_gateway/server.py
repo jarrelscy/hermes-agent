@@ -6155,6 +6155,11 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5036, f"delete failed: {e}")
     if not deleted:
         return _err(rid, 4007, "session not found")
+    try:
+        from tools.browser_tool import delete_pool_containers
+        delete_pool_containers(target)
+    except Exception:
+        pass
     return _ok(rid, {"deleted": target})
 
 
