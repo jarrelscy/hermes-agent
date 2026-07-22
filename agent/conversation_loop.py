@@ -4720,6 +4720,15 @@ def run_conversation(
                 # entire conversation.
                 truncated_tool_call_retries = 0
 
+                # A successful tool call is genuine progress, so refill the
+                # intent-ack / mid-flight continuation budget. The `< 2` cap is
+                # meant to stop an infinite nudge loop when the model refuses to
+                # act at all - NOT to give up on a long autonomous loop that
+                # makes progress but narrates-and-stalls every few steps. Reset
+                # here so the cap bounds only *consecutive* stalls with no
+                # intervening tool call.
+                codex_ack_continuations = 0
+
                 # Signal that a paragraph break is needed before the next
                 # streamed text.  We don't emit it immediately because
                 # multiple consecutive tool iterations would stack up
@@ -5079,7 +5088,7 @@ def run_conversation(
                 )
 
                 _ack_mode = intent_ack_continuation_mode(agent)
-                if (
+                _ack_continue = (
                     _ack_mode != "off"
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
@@ -5089,7 +5098,25 @@ def run_conversation(
                         messages=messages,
                         require_workspace=(_ack_mode == "codex_only"),
                     )
-                ):
+                )
+                # Mid-flight continuation (opt-in "all" mode only): the model has
+                # ALREADY been calling tools this turn, then emits a text-only
+                # "continuing.../next I'll..." line with finish_reason=stop and no
+                # tool_calls. That is a stall, not a completion. The first-turn
+                # ack detector deliberately bails when prior tool messages exist
+                # and is gated to codex_responses under "auto", so it cannot see
+                # this case on a chat_completions provider - this branch does.
+                _midflight_continue = (
+                    not _ack_continue
+                    and _ack_mode == "all"
+                    and agent.valid_tool_names
+                    and codex_ack_continuations < 2
+                    and agent._looks_like_midflight_continuation(
+                        assistant_content=final_response,
+                        messages=messages,
+                    )
+                )
+                if _ack_continue or _midflight_continue:
                     codex_ack_continuations += 1
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
                     messages.append(interim_msg)

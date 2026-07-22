@@ -2722,6 +2722,153 @@ def looks_like_codex_intermediate_ack(
     return user_targets_workspace or assistant_targets_workspace
 
 
+def looks_like_midflight_continuation(
+    agent,
+    assistant_content: str,
+    messages: List[Dict[str, Any]],
+) -> bool:
+    """Detect a mid-task stall: the model announces further action but issues no
+    tool call, so the loop should nudge it to continue rather than end the turn.
+
+    This is the mirror image of ``looks_like_codex_intermediate_ack`` (scoped to
+    a FIRST-turn planning ack: it requires *no* prior tool calls, an explicit
+    "I'll"-style future ack, and, under codex_only, a workspace reference). Here
+    the signal that a task is *mid-flight* is exactly what the first-turn
+    detector treats as disqualifying: the assistant has ALREADY produced tool
+    results this turn and then emitted a text-only "continuing.../next I'll.../
+    clicking..." line with ``finish_reason=stop`` and no ``tool_calls``. On a
+    chat_completions provider the first-turn detector can never fire here (prior
+    tool messages + non-codex api_mode), which is why a long autonomous loop
+    silently ends the turn mid-task. The caller gates this to the opt-in
+    ``intent_ack_continuation`` "all" mode and to the same per-turn cap.
+
+    Kept deliberately conservative to avoid nudging a genuine completion: bails
+    on an empty/oversized message, on a message that yields to the user (a
+    trailing question or an explicit hand-back phrase), and on one that signals
+    the task is finished.
+    """
+    # Mid-flight requires prior tool activity this turn; without it, this is not
+    # a continuation and the first-turn planning-ack detector owns the case.
+    if not any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
+        return False
+
+    text = agent._strip_think_blocks(assistant_content or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if len(lowered) > 1200:
+        return False
+
+    # Yielding to the user is a legitimate stop, not a stall - never override it.
+    if text.rstrip().endswith("?"):
+        return False
+    handback_markers = (
+        "let me know",
+        "would you like",
+        "do you want",
+        "should i ",
+        "shall i ",
+        "which would you",
+        "waiting for your",
+        "up to you",
+        "your call",
+        "confirm whether",
+        "let you decide",
+    )
+    if any(m in lowered for m in handback_markers):
+        return False
+
+    # Forward-intent / continuation signals. If the model is clearly signalling
+    # MORE work ("continuing... through the remaining... then the next section"),
+    # that dominates any incidental completion word. The single most common
+    # mid-flight phrasing is "completed <one item>, continuing through the
+    # remaining N" - which must be read as mid-flight, NOT as task completion.
+    forward_intent_markers = (
+        "continuing",
+        "continue with",
+        "continue the",
+        "continue through",
+        "remaining",
+        "next ",
+        "then i",
+        "then remaining",
+        "then the",
+        "moving on",
+        "moving to",
+        "proceed",
+        "on to the next",
+        "keep going",
+        "loop through",
+        "looping through",
+        "rapid loop",
+        "still need",
+        "yet to",
+    )
+    has_forward_intent = any(m in lowered for m in forward_intent_markers)
+
+    # An explicit WHOLE-TASK completion signal is a legitimate stop - but only
+    # when the model is not simultaneously signalling more work. Bare "completed"
+    # is deliberately NOT a marker here: "completed <item>, continuing..." is
+    # mid-flight, and requiring the whole-task phrasing avoids that false stop.
+    completion_markers = (
+        "task complete",
+        "task is complete",
+        "fully complete",
+        "all done",
+        "all complete",
+        "everything is done",
+        "that's everything",
+        "that is everything",
+        "no further",
+        "nothing more",
+        "nothing else",
+        "have finished",
+        "i'm done",
+        "im done",
+        "all set",
+        "wrapped up",
+    )
+    if not has_forward_intent and any(m in lowered for m in completion_markers):
+        return False
+
+    # Action-intent signal: an explicit future ack OR present-continuous
+    # narration of ongoing work ("continuing the loop", "clicking Next",
+    # "reporting each click"). This is what a stalled autonomous loop looks like.
+    intent_markers = (
+        "i'll",
+        "i will",
+        "let me",
+        "next i",
+        "then i",
+        "now i",
+        "continuing",
+        "continue with",
+        "continue the",
+        "moving on",
+        "moving to",
+        "proceeding",
+        "proceed to",
+        "next up",
+        "on to the next",
+        "clicking",
+        "opening",
+        "navigating",
+        "typing",
+        "scrolling",
+        "marking",
+        "reporting each",
+        "repeating",
+        "looping through",
+        "iterating",
+    )
+    # Forward-intent counts as action-intent too: "... Next video." signals more
+    # work even though it hits none of the explicit verb markers above.
+    if not (has_forward_intent or any(m in lowered for m in intent_markers)):
+        return False
+
+    return True
+
+
 def intent_ack_continuation_mode(agent) -> str:
     """Classify the resolved intent-ack continuation mode for this turn.
 
@@ -3233,6 +3380,7 @@ __all__ = [
     "repair_tool_call",
     "sanitize_api_messages",
     "looks_like_codex_intermediate_ack",
+    "looks_like_midflight_continuation",
     "copy_reasoning_content_for_api",
     "cleanup_dead_connections",
     "extract_api_error_context",
