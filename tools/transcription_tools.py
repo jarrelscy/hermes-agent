@@ -1086,6 +1086,17 @@ def _looks_like_cuda_lib_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CUDA_LIB_ERROR_MARKERS)
 
 
+def _looks_like_cuda_oom(exc: BaseException) -> bool:
+    """Is this a CUDA out-of-memory error?
+
+    The GPUs on shared hosts are often filled by model servers, leaving no
+    room for Whisper.  Falling back to CPU keeps voice working instead of
+    dropping every utterance until the GPU frees up.
+    """
+    msg = str(exc)
+    return "CUDA" in msg and "out of memory" in msg
+
+
 def _load_local_whisper_model(model_name: str):
     """Load faster-whisper with graceful CUDA → CPU fallback.
 
@@ -1103,13 +1114,20 @@ def _load_local_whisper_model(model_name: str):
     try:
         return WhisperModel(model_name, device="auto", compute_type="auto")
     except Exception as exc:
-        if not _looks_like_cuda_lib_error(exc):
+        if not (_looks_like_cuda_lib_error(exc) or _looks_like_cuda_oom(exc)):
             raise
-        logger.warning(
-            "faster-whisper CUDA load failed (%s) — falling back to CPU (int8). "
-            "Install the NVIDIA CUDA runtime (libcublas/libcudnn) to use GPU.",
-            exc,
-        )
+        if _looks_like_cuda_oom(exc):
+            logger.warning(
+                "faster-whisper CUDA load failed (%s) — GPU is full, "
+                "falling back to CPU (int8).",
+                exc,
+            )
+        else:
+            logger.warning(
+                "faster-whisper CUDA load failed (%s) — falling back to CPU (int8). "
+                "Install the NVIDIA CUDA runtime (libcublas/libcudnn) to use GPU.",
+                exc,
+            )
         return WhisperModel(model_name, device="cpu", compute_type="int8")
 
 
@@ -1134,7 +1152,27 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             or os.getenv(LOCAL_STT_LANGUAGE_ENV)
             or None
         )
-        transcribe_kwargs = {"beam_size": 5}
+        _stt_local = _load_stt_config().get("local") or {}
+        transcribe_kwargs = {
+            "beam_size": 5,
+            # Silero VAD strips non-speech before decoding, so silent/near-silent
+            # clips yield zero segments (empty transcript) instead of phantom
+            # text like "You"/"Thank you". Primary guard against Whisper
+            # hallucinating on empty audio. Toggle via stt.local.vad_filter.
+            "vad_filter": is_truthy_value(
+                _stt_local.get("vad_filter", True), default=True
+            ),
+            # Don't feed the prior segment's text back in — stops the model
+            # locking onto a repeated hallucination across segments.
+            "condition_on_previous_text": is_truthy_value(
+                _stt_local.get("condition_on_previous_text", False), default=False
+            ),
+        }
+        # Optional Silero tuning, e.g. stt.local.vad_parameters:
+        #   {min_silence_duration_ms: 500, speech_pad_ms: 200, threshold: 0.5}
+        _vad_params = _stt_local.get("vad_parameters")
+        if isinstance(_vad_params, dict) and _vad_params:
+            transcribe_kwargs["vad_parameters"] = _vad_params
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
 
@@ -1147,7 +1185,7 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             # model, reload on CPU, retry once.  Without this the module-
             # global `_local_model` is poisoned and every subsequent voice
             # message on this process fails identically until restart.
-            if not _looks_like_cuda_lib_error(exc):
+            if not (_looks_like_cuda_lib_error(exc) or _looks_like_cuda_oom(exc)):
                 raise
             logger.warning(
                 "faster-whisper CUDA runtime failed mid-transcribe (%s) — "
