@@ -391,8 +391,50 @@ class VoiceReceiver:
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
 
+        # Barge-in: monitor mic energy during playback without buffering the
+        # audio (echo-safe).  When True, packets are still decoded and their
+        # energy tracked, but the PCM is discarded so speaker echo of the
+        # bot's own TTS can never become a transcribable "user" turn.
+        self._monitor_only = False
+        self._barge_rms_threshold = 800.0
+        # Per-SSRC continuous "voiced run" tracking for barge-in detection.
+        self._voiced_since: Dict[int, Optional[float]] = {}
+        self._last_voiced_ts: Dict[int, float] = {}
+        # Per-SSRC "at least one voiced packet was buffered" flag.  Noise-only
+        # buffers (Discord speaking flag held up by ambient sound) are dropped
+        # without an STT call instead of completing every silence window.
+        self._voiced_seen: Dict[int, bool] = {}
+
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
+
+        # End-of-utterance tuning, from config.yaml ``voice:`` block.
+        # ``silence_threshold_seconds``: how long after the last VOICED packet
+        # before an utterance is considered complete and sent to STT — lower
+        # for snappier acks (natural mid-sentence pauses are usually < 0.5s).
+        # ``speech_rms_threshold``: int16 RMS floor for a packet to count as
+        # speech activity.  Discord keeps sending packets while its client-side
+        # VAD holds the speaking flag up, so on noisy setups (car, open
+        # speakers) low-energy packets would otherwise keep refreshing the
+        # activity timer and stretch the wait far past the configured silence
+        # window.  Packets below the floor are still buffered (word tails) but
+        # don't delay completion.  ``min_speech_duration_seconds``: minimum
+        # buffered audio to bother transcribing (short "yes"/"no" needs ~0.3).
+        cfg_voice = {}
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg_voice = (read_raw_config() or {}).get("voice") or {}
+        except Exception:
+            cfg_voice = {}
+        self.silence_threshold = max(
+            0.2, float(cfg_voice.get("silence_threshold_seconds") or 1.5)
+        )
+        self.min_speech_duration = max(
+            0.1, float(cfg_voice.get("min_speech_duration_seconds") or 0.5)
+        )
+        self._speech_rms_threshold = max(
+            1.0, float(cfg_voice.get("speech_rms_threshold") or 1200)
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -422,6 +464,7 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._voiced_seen.clear()
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
@@ -429,6 +472,78 @@ class VoiceReceiver:
 
     def resume(self):
         self._paused = False
+
+    # ------------------------------------------------------------------
+    # Barge-in (interrupt TTS by talking over it)
+    # ------------------------------------------------------------------
+
+    def set_monitor_only(self, value: bool):
+        """Toggle monitor-only mode.
+
+        In monitor-only mode packets are decoded and their energy is tracked
+        for barge-in, but the PCM is not buffered — so echo of the bot's own
+        TTS never accumulates into a transcribable utterance.
+        """
+        self._monitor_only = bool(value)
+
+    def reset_barge_state(self):
+        """Clear voiced-run tracking and any residual buffered audio.
+
+        Called just before playback so a pre-existing buffer or a stale
+        voiced run can't be mistaken for a fresh barge-in.
+        """
+        with self._lock:
+            self._voiced_since.clear()
+            self._last_voiced_ts.clear()
+            self._buffers.clear()
+            self._last_packet_time.clear()
+            self._voiced_seen.clear()
+
+    @staticmethod
+    def _frame_rms(pcm: bytes) -> float:
+        """Root-mean-square amplitude of a 16-bit PCM frame (0..32767)."""
+        if not pcm:
+            return 0.0
+        import array
+        samples = array.array("h")
+        try:
+            samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+        except ValueError:
+            return 0.0
+        n = len(samples)
+        if n == 0:
+            return 0.0
+        total = 0
+        for s in samples:
+            total += s * s
+        return (total / n) ** 0.5
+
+    def barge_in_detected(self, min_ms: float, not_before_ts: float) -> bool:
+        """True if an allowed user has sustained speech above the threshold.
+
+        A qualifying barge-in is a continuous voiced run that BEGAN after
+        ``not_before_ts`` (the post-grace point) and has lasted at least
+        ``min_ms``.  Requiring the run to start after the grace window means a
+        run that was already underway when playback began — including steady
+        speaker echo that never drops below threshold — does not count.
+        """
+        now = time.monotonic()
+        min_s = min_ms / 1000.0
+        with self._lock:
+            items = list(self._voiced_since.items())
+            ssrc_map = dict(self._ssrc_to_user)
+        for ssrc, since in items:
+            if since is None or since < not_before_ts:
+                continue
+            if (now - since) < min_s:
+                continue
+            uid = ssrc_map.get(ssrc, 0) or self._infer_user_for_ssrc(ssrc)
+            if not uid:
+                continue
+            if self._allowed_user_ids and str(uid) not in self._allowed_user_ids:
+                continue
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # SSRC -> user_id mapping via SPEAKING opcode hook
@@ -602,9 +717,39 @@ class VoiceReceiver:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
+            now = time.monotonic()
+            rms = self._frame_rms(pcm)
             with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+                # Track the current continuous voiced run for barge-in.  A
+                # short (<=120ms) dip below threshold is tolerated so natural
+                # micro-pauses within a word don't reset the run.
+                if rms >= self._barge_rms_threshold:
+                    if self._voiced_since.get(ssrc) is None:
+                        self._voiced_since[ssrc] = now
+                    self._last_voiced_ts[ssrc] = now
+                else:
+                    last = self._last_voiced_ts.get(ssrc)
+                    if last is None or (now - last) > 0.12:
+                        self._voiced_since[ssrc] = None
+                # In monitor-only mode we measure energy but discard the audio
+                # so echo of the bot's own TTS can't become a fake utterance.
+                if not self._monitor_only:
+                    self._buffers[ssrc].extend(pcm)
+                    if rms >= self._speech_rms_threshold:
+                        self._voiced_seen[ssrc] = True
+                    # Noise-gated activity: only packets at/above the speech
+                    # RMS floor refresh the end-of-utterance timer (plus a
+                    # short tail window after voiced frames so trailing
+                    # consonants and quiet syllables don't cut a word short).
+                    # Below-floor packets are buffered but never delay
+                    # completion — road/ambient noise that keeps Discord's
+                    # speaking flag up no longer stretches the silence wait.
+                    if (
+                        rms >= self._speech_rms_threshold
+                        or (now - self._last_voiced_ts.get(ssrc, 0.0)) <= 0.25
+                        or ssrc not in self._last_packet_time
+                    ):
+                        self._last_packet_time[ssrc] = now
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -661,7 +806,14 @@ class VoiceReceiver:
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                if silence_duration >= self.silence_threshold and buf_duration >= self.min_speech_duration:
+                    voiced = self._voiced_seen.pop(ssrc, False)
+                    if not voiced:
+                        # Noise-only buffer (ambient sound kept Discord's
+                        # speaking flag up): drop silently, no STT call.
+                        self._buffers[ssrc] = bytearray()
+                        self._last_packet_time.pop(ssrc, None)
+                        continue
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC not mapped (SPEAKING event missing after bot rejoin).
@@ -671,10 +823,11 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
+                elif silence_duration >= self.silence_threshold * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                    self._voiced_seen.pop(ssrc, None)
 
         return completed
 
@@ -849,6 +1002,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
+        self._barge_in_cfg: Dict[str, Any] = self._load_barge_in_config()
+        # When true, the bot never leaves a voice channel on its own — the
+        # inactivity auto-disconnect is suppressed so it sits in the channel
+        # and keeps listening indefinitely (car / always-on use).
+        self._voice_stay_connected: bool = self._load_stay_connected()
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -858,6 +1016,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
+        self._voice_autojoin_task: Optional[asyncio.Task] = None
         # REST-level liveness probe.  discord.py's WS reconnect handles clean
         # drops, but a dead proxy / NAT can wedge the socket without delivering
         # a RST — sends time out forever and ``client.start()`` never exits, so
@@ -1093,6 +1252,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     adapter_self._post_connect_task.cancel()
                 adapter_self._post_connect_task = asyncio.create_task(
                     adapter_self._run_post_connect_initialization()
+                )
+
+                # Auto-join a configured voice channel (e.g. #general) so the
+                # bot is always present and listening without anyone issuing
+                # /voice. Separate task so slash-command sync can't block it.
+                if adapter_self._voice_autojoin_task and not adapter_self._voice_autojoin_task.done():
+                    adapter_self._voice_autojoin_task.cancel()
+                adapter_self._voice_autojoin_task = asyncio.create_task(
+                    adapter_self._run_voice_auto_join()
                 )
 
             @self._client.event
@@ -1465,17 +1633,20 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning("[%s] Error during disconnect: %s", self.name, e, exc_info=True)
 
-        if self._post_connect_task and not self._post_connect_task.done():
-            self._post_connect_task.cancel()
-            try:
-                await self._post_connect_task
-            except asyncio.CancelledError:
-                pass
+        for _task_attr in ("_post_connect_task", "_voice_autojoin_task"):
+            _task = getattr(self, _task_attr, None)
+            if _task and not _task.done():
+                _task.cancel()
+                try:
+                    await _task
+                except asyncio.CancelledError:
+                    pass
 
         self._running = False
         self._client = None
         self._ready_event.clear()
         self._post_connect_task = None
+        self._voice_autojoin_task = None
         self._liveness_task = None
 
         self._release_platform_lock()
@@ -2732,6 +2903,59 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.voice_fx config: %s", e)
         return defaults
 
+    def _load_barge_in_config(self) -> Dict[str, Any]:
+        """Read voice barge-in settings from config.yaml (``voice.barge_in``).
+
+        Barge-in lets a user interrupt Hermes' spoken reply by talking over
+        it.  It is echo-aware: while TTS plays the mic is monitored for energy
+        but the captured audio is discarded (so the bot never transcribes its
+        own voice back as a user turn), and playback only stops when a user
+        sustains speech above ``rms_threshold`` for ``min_speech_ms`` after an
+        initial ``grace_ms`` window.  On open speakers (no acoustic echo
+        cancellation) raise ``rms_threshold`` if Hermes interrupts itself.
+        """
+        defaults: Dict[str, Any] = {
+            "enabled": True,       # master switch
+            "rms_threshold": 800,  # int16 RMS floor; raise if it self-interrupts
+            "min_speech_ms": 400,  # sustained speech required to interrupt
+            "grace_ms": 600,       # ignore the mic for the first N ms of a reply
+        }
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            bi = ((cfg.get("voice") or {}).get("barge_in") or {})
+            if isinstance(bi, dict):
+                for k, v in bi.items():
+                    if k in defaults and v is not None:
+                        defaults[k] = v
+        except Exception as e:
+            logger.debug("Could not load voice.barge_in config: %s", e)
+        return defaults
+
+    def _load_stay_connected(self) -> bool:
+        """Whether the bot stays in a voice channel indefinitely.
+
+        When ``voice.stay_connected: true`` (config.yaml) or the env override
+        ``HERMES_DISCORD_VOICE_STAY_CONNECTED`` is truthy, the inactivity
+        auto-disconnect never fires: once joined (via ``/voice on``) the bot
+        remains in the channel listening until it is told to leave or the
+        gateway stops.  Suits an always-on / in-car setup where re-issuing
+        ``/voice on`` after every silent stretch is a nuisance.
+        """
+        env = os.getenv("HERMES_DISCORD_VOICE_STAY_CONNECTED", "").strip().lower()
+        if env in ("1", "true", "yes", "on"):
+            return True
+        if env in ("0", "false", "no", "off"):
+            return False
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            val = (cfg.get("voice") or {}).get("stay_connected")
+            return bool(val)
+        except Exception as e:
+            logger.debug("Could not load voice.stay_connected config: %s", e)
+        return False
+
     def _get_ambient_pcm(self) -> Optional[bytes]:
         """Return decoded 48k/stereo/s16le PCM for the ambient idle bed.
 
@@ -2849,6 +3073,157 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    def _match_voice_channel(self, guild, target: str):
+        """Find a voice channel in *guild* by numeric ID or case-insensitive name."""
+        t = str(target).strip()
+        if not t:
+            return None
+        if t.isdigit():
+            ch = self._client.get_channel(int(t))
+            if ch is not None and getattr(ch, "guild", None) and ch.guild.id == guild.id \
+                    and isinstance(ch, discord.VoiceChannel):
+                return ch
+            return None
+        tl = t.lower()
+        for ch in getattr(guild, "voice_channels", []):
+            if ch.name.lower() == tl:
+                return ch
+        return None
+
+    def _match_text_channel_id(self, guild, target) -> Optional[int]:
+        """Resolve the text channel to link voice replies/transcripts to.
+
+        Order: explicit config target (ID or name) → a #general text channel →
+        the guild system channel → the first channel the bot can post in.
+        """
+        def sendable(ch) -> bool:
+            me = getattr(guild, "me", None)
+            if me is None:
+                return True
+            try:
+                return ch.permissions_for(me).send_messages
+            except Exception:
+                return True
+
+        if target:
+            t = str(target).strip()
+            if t.isdigit():
+                ch = self._client.get_channel(int(t))
+                if ch is not None and getattr(ch, "guild", None) and ch.guild.id == guild.id \
+                        and isinstance(ch, discord.TextChannel):
+                    return ch.id
+            else:
+                tl = t.lower()
+                for ch in guild.text_channels:
+                    if ch.name.lower() == tl and sendable(ch):
+                        return ch.id
+        for ch in guild.text_channels:
+            if ch.name.lower() == "general" and sendable(ch):
+                return ch.id
+        sys_ch = getattr(guild, "system_channel", None)
+        if sys_ch is not None and sendable(sys_ch):
+            return sys_ch.id
+        for ch in guild.text_channels:
+            if sendable(ch):
+                return ch.id
+        return None
+
+    # How often the voice watchdog checks that we are still in the channel.
+    VOICE_WATCHDOG_INTERVAL = 30
+
+    async def _run_voice_auto_join(self) -> None:
+        """Join the configured voice channel on connect, then keep it joined.
+
+        Driven by ``discord.voice_auto_join_channel`` (name or numeric ID). No-op
+        when unset. Runs one join pass on connect, then — when
+        ``voice.stay_connected`` is on — supervises the connection forever,
+        rejoining if the bot ever drops out. This heals voice-only websocket
+        drops, which never re-fire ``on_ready`` and so were previously silent.
+        """
+        if not self._client:
+            return
+        await self._voice_auto_join_pass(initial=True)
+
+        if not getattr(self, "_voice_stay_connected", False):
+            return
+        while True:
+            try:
+                await asyncio.sleep(self.VOICE_WATCHDOG_INTERVAL)
+                if not self._client:
+                    continue
+                from hermes_cli.config import read_raw_config
+                dcfg = (read_raw_config() or {}).get("discord") or {}
+                target = str(dcfg.get("voice_auto_join_channel") or "").strip()
+                if not target:
+                    continue
+                # Rejoin only if we have a matching channel but are not in voice
+                # there — leaves a manual move to another channel untouched.
+                dropped = False
+                for guild in list(self._client.guilds):
+                    if self._match_voice_channel(guild, target) is None:
+                        continue
+                    if not self.is_in_voice_channel(guild.id):
+                        dropped = True
+                        break
+                if dropped:
+                    logger.warning(
+                        "[%s] voice watchdog: dropped from %r; rejoining",
+                        self.name, target,
+                    )
+                    await self._voice_auto_join_pass(initial=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("[%s] voice watchdog error: %s", self.name, e, exc_info=True)
+
+    async def _voice_auto_join_pass(self, *, initial: bool) -> None:
+        """One idempotent join pass over every guild with the target channel.
+
+        ``join_voice_channel`` returns early when already connected, so re-running
+        this from the watchdog is safe. ``initial`` only tunes log verbosity.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            dcfg = (read_raw_config() or {}).get("discord") or {}
+            target = str(dcfg.get("voice_auto_join_channel") or "").strip()
+            if not target:
+                return
+            runner = getattr(self, "gateway_runner", None)
+            if runner is None or not hasattr(runner, "autojoin_voice_channel"):
+                logger.warning("[%s] voice auto-join set but runner hook missing", self.name)
+                return
+            text_target = dcfg.get("voice_auto_join_text_channel")
+
+            joined = 0
+            for guild in list(self._client.guilds):
+                vch = self._match_voice_channel(guild, target)
+                if vch is None:
+                    continue
+                tch_id = self._match_text_channel_id(guild, text_target)
+                if tch_id is None:
+                    logger.warning(
+                        "[%s] auto-join: no sendable text channel in guild %s; skipping",
+                        self.name, guild.id,
+                    )
+                    continue
+                try:
+                    if await runner.autojoin_voice_channel(self, vch, tch_id):
+                        joined += 1
+                        logger.info(
+                            "[%s] Auto-joined voice channel #%s (guild %s, linked text #%s)",
+                            self.name, vch.name, guild.id, tch_id,
+                        )
+                except Exception as e:
+                    logger.warning("[%s] auto-join failed for #%s: %s",
+                                   self.name, getattr(vch, "name", "?"), e, exc_info=True)
+            if joined == 0 and initial:
+                logger.info("[%s] voice auto-join: no channel matching %r found",
+                            self.name, target)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[%s] voice auto-join error: %s", self.name, e, exc_info=True)
+
     async def join_voice_channel(self, channel) -> bool:
         """Join a Discord voice channel. Returns True on success."""
         if not self._client or not DISCORD_AVAILABLE:
@@ -2865,6 +3240,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 await existing.move_to(channel)
                 self._reset_voice_timeout(guild_id)
                 return True
+
+            # A handle lingering from a dropped connection blocks a fresh
+            # connect(); tear it down (force-disconnect) before reconnecting.
+            if existing is not None:
+                await self._teardown_voice_state(guild_id, force=True)
 
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc
@@ -2895,31 +3275,46 @@ class DiscordAdapter(BasePlatformAdapter):
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-            # Stop voice receiver first
-            receiver = self._voice_receivers.pop(guild_id, None)
-            if receiver:
-                receiver.stop()
-            listen_task = self._voice_listen_tasks.pop(guild_id, None)
-            if listen_task:
-                listen_task.cancel()
+            await self._teardown_voice_state(guild_id, force=False)
 
-            # Tear down the mixer (stops the continuous outgoing stream).
-            if getattr(self, "_voice_mixers", None) is not None:
-                self._voice_mixers.pop(guild_id, None)
+    async def _teardown_voice_state(self, guild_id: int, *, force: bool) -> None:
+        """Tear down all voice state for a guild. Caller must hold the guild lock.
 
-            vc = self._voice_clients.pop(guild_id, None)
-            if vc and vc.is_connected():
-                try:
-                    if vc.is_playing():
-                        vc.stop()
-                except Exception:
-                    pass
-                await vc.disconnect()
-            task = self._voice_timeout_tasks.pop(guild_id, None)
-            if task:
-                task.cancel()
-            self._voice_text_channels.pop(guild_id, None)
-            self._voice_sources.pop(guild_id, None)
+        ``force`` disconnects the ``VoiceClient`` even when it already reports
+        ``is_connected() == False`` — the state we land in after a voice-only
+        websocket drop, where the handle lingers and would otherwise make a
+        fresh ``channel.connect()`` raise "Already connected".
+        """
+        receiver = self._voice_receivers.pop(guild_id, None)
+        if receiver:
+            receiver.stop()
+        listen_task = self._voice_listen_tasks.pop(guild_id, None)
+        if listen_task:
+            listen_task.cancel()
+
+        # Tear down the mixer (stops the continuous outgoing stream).
+        if getattr(self, "_voice_mixers", None) is not None:
+            self._voice_mixers.pop(guild_id, None)
+
+        vc = self._voice_clients.pop(guild_id, None)
+        if vc:
+            try:
+                if vc.is_connected() and vc.is_playing():
+                    vc.stop()
+            except Exception:
+                pass
+            try:
+                if vc.is_connected():
+                    await vc.disconnect()
+                elif force:
+                    await vc.disconnect(force=True)
+            except Exception:
+                pass
+        task = self._voice_timeout_tasks.pop(guild_id, None)
+        if task:
+            task.cancel()
+        self._voice_text_channels.pop(guild_id, None)
+        self._voice_sources.pop(guild_id, None)
 
     # Maximum seconds to wait for voice playback before giving up
     PLAYBACK_TIMEOUT = 120
@@ -2949,23 +3344,54 @@ class DiscordAdapter(BasePlatformAdapter):
                 mixer.play_speech(pcm, gain=speech_gain)
                 # Block until the speech child drains so callers serialise
                 # replies (mirrors legacy semantics) but the ambient keeps
-                # playing underneath the whole time.
+                # playing underneath the whole time.  While it drains we watch
+                # the mic for a barge-in and cut the speech short if the user
+                # talks over it.
+                receiver = self._voice_receivers.get(guild_id)
+                barge = getattr(self, "_barge_in_cfg", {}) or {}
+                barge_enabled = bool(barge.get("enabled")) and receiver is not None
+                if barge_enabled:
+                    receiver.reset_barge_state()
+                    receiver._barge_rms_threshold = float(barge.get("rms_threshold", 800))
+                    receiver.set_monitor_only(True)
                 wait_start = time.monotonic()
-                while mixer.speech_active:
-                    if time.monotonic() - wait_start > self.PLAYBACK_TIMEOUT:
-                        logger.warning("Mixer speech playback timed out after %ds", self.PLAYBACK_TIMEOUT)
-                        mixer.stop_speech()
-                        break
-                    await asyncio.sleep(0.05)
+                not_before = wait_start + float(barge.get("grace_ms", 600)) / 1000.0
+                min_ms = float(barge.get("min_speech_ms", 400))
+                try:
+                    while mixer.speech_active:
+                        if time.monotonic() - wait_start > self.PLAYBACK_TIMEOUT:
+                            logger.warning("Mixer speech playback timed out after %ds", self.PLAYBACK_TIMEOUT)
+                            mixer.stop_speech()
+                            break
+                        if (barge_enabled
+                                and time.monotonic() >= not_before
+                                and receiver.barge_in_detected(min_ms, not_before)):
+                            logger.info("Barge-in detected — stopping TTS playback (mixer)")
+                            receiver.set_monitor_only(False)  # capture the user's utterance
+                            mixer.stop_speech()
+                            break
+                        await asyncio.sleep(0.05)
+                finally:
+                    if barge_enabled:
+                        receiver.set_monitor_only(False)
                 self._reset_voice_timeout(guild_id)
                 return True
             logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
 
         # ── Legacy one-shot path (no mixer) ─────────────────────────────
-        # Pause voice receiver while playing (echo prevention)
+        # Barge-in enabled: keep the receiver alive in monitor-only mode so we
+        # can hear the user talk over the reply without transcribing our own
+        # echo.  Disabled: fall back to the historical full pause (echo prevention).
         receiver = self._voice_receivers.get(guild_id)
+        barge = getattr(self, "_barge_in_cfg", {}) or {}
+        barge_enabled = bool(barge.get("enabled")) and receiver is not None
         if receiver:
-            receiver.pause()
+            if barge_enabled:
+                receiver.reset_barge_state()
+                receiver._barge_rms_threshold = float(barge.get("rms_threshold", 800))
+                receiver.set_monitor_only(True)
+            else:
+                receiver.pause()
 
         try:
             # Wait for current playback to finish (with timeout)
@@ -2988,16 +3414,36 @@ class DiscordAdapter(BasePlatformAdapter):
             source = discord.FFmpegPCMAudio(audio_path)
             source = discord.PCMVolumeTransformer(source, volume=1.0)
             vc.play(source, after=_after)
+
+            play_start = time.monotonic()
+            not_before = play_start + float(barge.get("grace_ms", 600)) / 1000.0
+            min_ms = float(barge.get("min_speech_ms", 400))
+            while not done.is_set():
+                if time.monotonic() - play_start > self.PLAYBACK_TIMEOUT:
+                    logger.warning("Voice playback timed out after %ds", self.PLAYBACK_TIMEOUT)
+                    vc.stop()
+                    break
+                if (barge_enabled
+                        and time.monotonic() >= not_before
+                        and receiver.barge_in_detected(min_ms, not_before)):
+                    logger.info("Barge-in detected — stopping TTS playback")
+                    receiver.set_monitor_only(False)  # capture the user's utterance
+                    vc.stop()
+                    break
+                await asyncio.sleep(0.05)
+            # Let the after-callback settle so the next reply serialises cleanly.
             try:
-                await asyncio.wait_for(done.wait(), timeout=self.PLAYBACK_TIMEOUT)
+                await asyncio.wait_for(done.wait(), timeout=2.0)
             except asyncio.TimeoutError:
-                logger.warning("Voice playback timed out after %ds", self.PLAYBACK_TIMEOUT)
-                vc.stop()
+                pass
             self._reset_voice_timeout(guild_id)
             return True
         finally:
             if receiver:
-                receiver.resume()
+                if barge_enabled:
+                    receiver.set_monitor_only(False)
+                else:
+                    receiver.resume()
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""
@@ -3025,6 +3471,10 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             await asyncio.sleep(self.VOICE_TIMEOUT)
         except asyncio.CancelledError:
+            return
+        # Always-on mode: never leave on inactivity.  The bot stays in the
+        # channel listening until /voice leave or gateway shutdown.
+        if getattr(self, "_voice_stay_connected", False):
             return
         text_ch_id = self._voice_text_channels.get(guild_id)
         # ``/voice off`` mutes spoken replies but deliberately keeps the bot in

@@ -5433,6 +5433,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # work. Explicit ``/stop`` and ``/new`` slash commands go through
         # ``_interrupt_and_clear_session`` and are unaffected — the
         # operator still has a way to force-cancel everything.
+        # Live voice-channel speech arrives in fragments, and "did you get
+        # that?" follow-ups are common while a long turn runs.  Interrupting
+        # on each one kills the work in progress, so steer voice-channel
+        # input into the running turn instead (falls back to queue).
+        if (
+            effective_mode == "interrupt"
+            and event.message_type == MessageType.VOICE
+            and getattr(event.raw_message, "guild_id", None) is not None
+        ):
+            effective_mode = "steer"
         demoted_for_subagents = (
             effective_mode == "interrupt"
             and self._agent_has_active_subagents(running_agent)
@@ -12867,6 +12877,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter._voice_input_callback = None
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
 
+    async def autojoin_voice_channel(self, adapter, voice_channel, text_channel_id: int) -> bool:
+        """Join a voice channel without a user command (startup auto-join).
+
+        Mirrors the wiring of ``_handle_voice_channel_join`` but the target
+        comes from config (``discord.voice_auto_join_channel``) instead of a
+        user's ``/voice`` message, and the linked text channel is resolved by
+        the adapter rather than taken from an event.  Called from the Discord
+        adapter's on-ready path so the bot sits in e.g. #general and listens
+        continuously.  Idempotent: ``join_voice_channel`` no-ops if already
+        connected, so this is safe to re-run on every reconnect.
+        """
+        from gateway.platforms.base import Platform
+
+        guild_id = voice_channel.guild.id
+        chat_id = str(text_channel_id)
+
+        # Wire callbacks BEFORE join so audio arriving immediately after
+        # connection is routed rather than dropped.
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+        if hasattr(adapter, "_voice_mode_getter"):
+            adapter._voice_mode_getter = lambda cid: self._voice_mode.get(
+                self._voice_key(Platform.DISCORD, str(cid)), "off"
+            )
+
+        try:
+            success = await adapter.join_voice_channel(voice_channel)
+        except Exception as e:
+            logger.warning("Auto-join voice channel failed: %s", e)
+            return False
+        if not success:
+            return False
+
+        adapter._voice_text_channels[guild_id] = int(text_channel_id)
+        # "all" = speak replies and listen; matches a manual /voice on join.
+        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "all"
+        self._save_voice_modes()
+        self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+        return True
+
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         """Leave the Discord voice channel."""
         adapter = self._adapter_for_source(event.source)
@@ -17149,6 +17201,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _ack_err:
                 logger.debug("voice ack schedule failed: %s", _ack_err)
+            _voice_narrate_last[0] = time.monotonic()
+
+        # ── Discord voice narration for long turns ──────────────────────
+        # Text-channel progress is invisible to someone listening in a voice
+        # channel, so speak the model's interim commentary (rate-limited) and
+        # a "still working" line when nothing has been said for a while.
+        _VOICE_NARRATE_MIN_GAP = 15.0   # seconds between spoken updates
+        _VOICE_HEARTBEAT_GAP = 45.0     # silence before a "still working" line
+        _voice_narrate_last = [time.monotonic()]
+
+        def _voice_narration_phrase(text: str, limit: int = 180) -> str:
+            """First sentence or two of ``text``, stripped of markdown."""
+            s = re.sub(r"```.*?```", " ", str(text or ""), flags=re.S)
+            s = re.sub(r"`([^`]*)`", r"\1", s)
+            s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)
+            s = re.sub(r"[*_#>|~]+", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            if len(s) <= limit:
+                return s
+            out = ""
+            for sentence in re.split(r"(?<=[.!?])\s+", s):
+                if out and len(out) + len(sentence) + 1 > limit:
+                    break
+                out = f"{out} {sentence}".strip()
+            return out if out and len(out) <= limit else s[:limit].rsplit(" ", 1)[0] + "…"
+
+        def _voice_narrate(text: str, *, force: bool = False) -> None:
+            if _voice_ack_guild[0] is None or not _run_still_current():
+                return
+            now = time.monotonic()
+            if not force and now - _voice_narrate_last[0] < _VOICE_NARRATE_MIN_GAP:
+                return
+            phrase = _voice_narration_phrase(text)
+            if not phrase:
+                return
+            _adapter = self.adapters.get(Platform.DISCORD)
+            if _adapter is None or not hasattr(_adapter, "play_ack_in_voice"):
+                return
+            _voice_narrate_last[0] = now
+            safe_schedule_threadsafe(
+                _adapter.play_ack_in_voice(_voice_ack_guild[0], phrase),
+                _voice_ack_loop,
+                logger=logger,
+                log_message="voice narration scheduling error",
+            )
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -18059,6 +18156,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                _voice_narrate(text)
                 display_text = text
                 if _stream_consumer is not None:
                     if already_streamed:
@@ -19370,6 +19468,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
+        async def _voice_heartbeat():
+            # Speak "still working" when a voice turn has been quiet too long.
+            if _voice_ack_guild[0] is None:
+                return
+            while True:
+                await asyncio.sleep(5)
+                if time.monotonic() - _voice_narrate_last[0] < _VOICE_HEARTBEAT_GAP:
+                    continue
+                phrase = "Still working on it."
+                _agent_ref = agent_holder[0]
+                if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
+                    try:
+                        _tool = _agent_ref.get_activity_summary().get("current_tool")
+                        if _tool:
+                            phrase = f"Still working, running {str(_tool).replace('_', ' ')}."
+                    except Exception:
+                        pass
+                _voice_narrate(phrase, force=True)
+
+        _voice_heartbeat_task = asyncio.create_task(_voice_heartbeat())
+
         def _stream_confirmed_final_delivery(
             consumer,
             final_text: str,
@@ -19900,6 +20019,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 log_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
+            _voice_heartbeat_task.cancel()
 
             # Wait for stream consumer to finish its final edit
             if stream_task:
@@ -19944,7 +20064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._update_runtime_status("draining")
             
             # Wait for cancelled tasks
-            for task in [progress_task, log_task, interrupt_monitor, tracking_task, _notify_task]:
+            for task in [progress_task, log_task, interrupt_monitor, tracking_task, _notify_task, _voice_heartbeat_task]:
                 if task:
                     try:
                         await task

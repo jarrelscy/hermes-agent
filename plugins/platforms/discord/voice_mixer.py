@@ -51,6 +51,11 @@ if TYPE_CHECKING:  # numpy is an optional ("voice" extra) dep — never import a
 
 logger = logging.getLogger(__name__)
 
+try:  # discord.py's VoiceClient.play() isinstance-checks for AudioSource
+    from discord import AudioSource as _AudioSourceBase
+except ImportError:  # pragma: no cover - discord.py absent (tests/tools)
+    _AudioSourceBase = object
+
 
 def _require_numpy():
     """Import numpy lazily.
@@ -145,7 +150,7 @@ class MixerChild:
         return samples
 
 
-class VoiceMixer:
+class VoiceMixer(_AudioSourceBase):
     """A continuous ``discord.AudioSource`` that mixes N child streams.
 
     Use :meth:`set_ambient` to install/replace the looping idle bed and
