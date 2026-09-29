@@ -13,7 +13,7 @@ STATE_FILE = CONFIG_ROOT / "pool_state.json"
 DASH_PORT = int(os.environ.get("HERMES_WEBTOP_DASH_PORT", "8899"))
 LAN_OFFSET = int(os.environ.get("HERMES_WEBTOP_DASH_LAN_OFFSET", "100"))
 _HTTPS_PORT = int(os.environ.get("HERMES_WEBTOP_DASH_HTTPS_PORT", "3001"))
-_FWDS: dict = {}
+_FWDS: dict = {}  # lan_port -> container currently served on it
 _FWD_LOCK = threading.Lock()
 _BRIDGE_CACHE: dict = {}
 _BRIDGE_TTL = 10.0
@@ -68,7 +68,7 @@ def _pipe(a: socket.socket, b: socket.socket) -> None:
                 pass
 
 # Forwarder: 0.0.0.0:(novnc_port+offset) -> container bridge IP:3001 (HTTPS)
-def _serve_forwarder(lan_port: int, container: str) -> None:
+def _serve_forwarder(lan_port: int) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -77,13 +77,16 @@ def _serve_forwarder(lan_port: int, container: str) -> None:
     except Exception as e:
         print(f"[fwd] bind {lan_port} failed: {e}", flush=True)
         return
-    print(f"[fwd] 0.0.0.0:{lan_port} -> {container}:{_HTTPS_PORT} (https via bridge IP)", flush=True)
+    print(f"[fwd] 0.0.0.0:{lan_port} -> {_FWDS.get(lan_port)}:{_HTTPS_PORT} (https via bridge IP)", flush=True)
     while True:
         try:
             client, _ = srv.accept()
         except Exception:
             continue
-        ip = _bridge_ip(container)
+        # Pooled containers get recycled onto the same noVNC port, so resolve
+        # the current container per connection instead of binding it once.
+        container = _FWDS.get(lan_port)
+        ip = _bridge_ip(container) if container else None
         if not ip:
             try:
                 client.close()
@@ -92,6 +95,9 @@ def _serve_forwarder(lan_port: int, container: str) -> None:
             continue
         try:
             upstream = socket.create_connection((ip, _HTTPS_PORT), timeout=8)
+            # The connect timeout would otherwise persist and drop idle
+            # websocket sessions after 8s of quiet.
+            upstream.settimeout(None)
         except Exception:
             try:
                 client.close()
@@ -105,10 +111,10 @@ def _serve_forwarder(lan_port: int, container: str) -> None:
 def _ensure_forwarder(novnc_port: int, container: str) -> int:
     lan_port = novnc_port + LAN_OFFSET
     with _FWD_LOCK:
-        if container in _FWDS:
-            return _FWDS[container]
-        threading.Thread(target=_serve_forwarder, args=(lan_port, container), daemon=True).start()
-        _FWDS[container] = lan_port
+        known = lan_port in _FWDS
+        _FWDS[lan_port] = container
+        if not known:
+            threading.Thread(target=_serve_forwarder, args=(lan_port,), daemon=True).start()
     return lan_port
 
 # Read pool state JSON
