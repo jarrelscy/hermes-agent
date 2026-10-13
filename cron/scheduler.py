@@ -3136,7 +3136,10 @@ def run_job(
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # Fixed task_id so the run's webtop can be torn down when the job ends.
+        _cron_future = _cron_pool.submit(
+            _cron_context.run, agent.run_conversation, prompt, task_id=_cron_session_id,
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -3329,6 +3332,16 @@ def run_job(
             _terminal_cwd_lock.release_write()
         else:
             _terminal_cwd_lock.release_read()
+        # Each cron run gets its own webtop (task_id = the run's session id)
+        # that nothing reuses afterwards; delete it and its volume so runs
+        # don't fill the pool and LRU-evict live threads' desktops.
+        _run_task_id = locals().get("_cron_session_id")
+        if _run_task_id:
+            try:
+                from tools.browser_webtop_pool import delete_task as _pool_delete
+                _pool_delete(_run_task_id)
+            except Exception as _e:
+                logger.debug("Job '%s': webtop cleanup failed: %s", job_id, _e)
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
