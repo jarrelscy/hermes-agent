@@ -17227,13 +17227,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 out = f"{out} {sentence}".strip()
             return out if out and len(out) <= limit else s[:limit].rsplit(" ", 1)[0] + "…"
 
-        def _voice_narrate(text: str, *, force: bool = False) -> None:
+        def _voice_narrate(text: str, *, force: bool = False, full: bool = False) -> None:
+            # full=True: interim assistant messages, which are often answers to
+            # questions steered in mid-turn — speak them whole, never dropped.
             if _voice_ack_guild[0] is None or not _run_still_current():
                 return
             now = time.monotonic()
-            if not force and now - _voice_narrate_last[0] < _VOICE_NARRATE_MIN_GAP:
+            if not (force or full) and now - _voice_narrate_last[0] < _VOICE_NARRATE_MIN_GAP:
                 return
-            phrase = _voice_narration_phrase(text)
+            phrase = _voice_narration_phrase(text, limit=2000 if full else 180)
             if not phrase:
                 return
             _adapter = self.adapters.get(Platform.DISCORD)
@@ -18156,7 +18158,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
-                _voice_narrate(text)
+                _voice_narrate(text, full=True)
                 display_text = text
                 if _stream_consumer is not None:
                     if already_streamed:
@@ -19476,6 +19478,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await asyncio.sleep(5)
                 if time.monotonic() - _voice_narrate_last[0] < _VOICE_HEARTBEAT_GAP:
                     continue
+                _hb_mixer = getattr(self.adapters.get(Platform.DISCORD), "_voice_mixers", {}).get(_voice_ack_guild[0])
+                if _hb_mixer is not None and _hb_mixer.speech_active:
+                    # Still speaking an earlier update — count that as recent.
+                    _voice_narrate_last[0] = time.monotonic()
+                    continue
                 phrase = "Still working on it."
                 _agent_ref = agent_holder[0]
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
@@ -19902,6 +19909,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
                         )
+                    # Speak it too when in a voice channel: this path bypasses
+                    # base.py's auto-TTS, so replies that finish while another
+                    # voice message is waiting were text-only.  Queued on the
+                    # mixer (non-blocking) so the follow-up turn starts now.
+                    if first_response and _voice_ack_guild[0] is not None and hasattr(adapter, "play_ack_in_voice"):
+                        _first_speech = adapter.prepare_tts_text(first_response) if hasattr(adapter, "prepare_tts_text") else first_response
+                        if _first_speech:
+                            asyncio.create_task(adapter.play_ack_in_voice(_voice_ack_guild[0], _first_speech))
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in

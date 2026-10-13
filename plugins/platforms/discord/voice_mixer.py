@@ -260,18 +260,18 @@ class VoiceMixer(_AudioSourceBase):
             np = _require_numpy()
             acc: "Optional[np.ndarray]" = None
 
-            # Speech children (drop exhausted ones; release duck when last ends)
-            if self._speech:
-                still_live: List[MixerChild] = []
-                for child in self._speech:
-                    frame = child.read_frame()
-                    if frame is None:
-                        continue
-                    acc = frame if acc is None else acc + frame
-                    still_live.append(child)
-                self._speech = still_live
-                if not self._speech and self._speech_active:
-                    self._begin_duck_release_locked()
+            # Speech children play one after another (FIFO) so an ack or
+            # narration queued during a reply doesn't talk over it.  Release
+            # the duck when the last one ends.
+            while self._speech:
+                frame = self._speech[0].read_frame()
+                if frame is None:
+                    self._speech.pop(0)
+                    continue
+                acc = frame
+                break
+            if not self._speech and self._speech_active:
+                self._begin_duck_release_locked()
 
             # Ambient bed — ramp gain back up during duck-release.
             if self._ambient is not None:

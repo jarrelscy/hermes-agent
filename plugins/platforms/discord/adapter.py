@@ -3044,6 +3044,7 @@ class DiscordAdapter(BasePlatformAdapter):
             result = json.loads(result_json)
             actual = result.get("file_path", audio_path)
             if not result.get("success") or not os.path.isfile(actual):
+                logger.warning("Voice ack TTS failed: %s", result.get("error"))
                 return False
             try:
                 from voice_mixer import decode_to_pcm
@@ -3051,14 +3052,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 from .voice_mixer import decode_to_pcm
             pcm = await asyncio.to_thread(decode_to_pcm, actual)
             if not pcm:
+                logger.warning("Voice ack decode failed for %s", actual)
                 return False
             mixer.play_speech(
                 pcm, gain=float(self._voice_fx_cfg.get("speech_gain", 1.0))
             )
+            logger.info("[%s] Speaking in voice channel (guild=%d): %s", self.name, guild_id, phrase[:80])
             self._reset_voice_timeout(guild_id)
             return True
         except Exception as e:
-            logger.debug("play_ack_in_voice failed: %s", e)
+            logger.warning("play_ack_in_voice failed: %s", e)
             return False
         finally:
             for p in {audio_path, locals().get("actual")}:
