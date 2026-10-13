@@ -2018,6 +2018,30 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     }
 
 
+def _pool_session_stale(task_id: str, session_info: Dict[str, Any]) -> bool:
+    """True if a cached webtop-pool session points at an outdated CDP URL.
+
+    get_cdp_url() also wakes the thread's container (recreating it if it was
+    reaped or evicted) and relaunches a dead Chrome, so calling it here on
+    every browser command keeps long-lived threads working.
+    """
+    if _is_local_sidecar_key(task_id) or session_info.get("_closing"):
+        # _closing: the cleanup path's own "close" command must neither
+        # recurse into another cleanup nor wake a reaped container.
+        return False
+    if not (session_info.get("features") or {}).get("cdp_override"):
+        return False
+    try:
+        from tools.browser_webtop_pool import get_cdp_url as _pool_cdp_url, pool_enabled
+        if not pool_enabled():
+            return False
+        current = _pool_cdp_url(task_id) or ""
+    except Exception as e:
+        logger.debug("webtop pool check for task %s failed: %s", task_id, e)
+        return False
+    return bool(current) and current != session_info.get("cdp_url")
+
+
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Get or create session info for the given session key.
@@ -2047,8 +2071,20 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
     with _cleanup_lock:
         # Check if we already have a session for this task
-        if task_id in _active_sessions:
-            return _active_sessions[task_id]
+        cached = _active_sessions.get(task_id)
+    if cached is not None:
+        if not _pool_session_stale(task_id, cached):
+            return cached
+        # The thread's webtop was reaped/evicted and came back on a new host
+        # port. The agent-browser daemon stays bound to the CDP URL it started
+        # with (a different --cdp on later commands is ignored), so drop the
+        # old daemon and build a fresh session on the new port.
+        logger.info("webtop for task %s moved to a new CDP port; recreating browser session",
+                    task_id)
+        _cleanup_single_browser_session(task_id)
+        with _cleanup_lock:
+            if task_id in _active_sessions:
+                return _active_sessions[task_id]
 
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
@@ -2852,6 +2888,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             _pool_ensure_warm(nav_session_key, _kp_host, timeout=120.0)
     except Exception as _e:
         logger.debug("browser_navigate: kasada ensure_warm skipped: %s", _e)
+    # A mint can block for a minute or more; don't let the inactivity reaper
+    # close this session underneath the navigate that's about to run.
+    _update_session_activity(nav_session_key)
 
     result = _run_browser_command(
         nav_session_key,
@@ -4382,6 +4421,8 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     if session_info:
         bb_session_id = session_info.get("bb_session_id", "unknown")
         logger.debug("Found session for task %s: bb_session_id=%s", task_id, bb_session_id)
+
+        session_info["_closing"] = True
 
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)

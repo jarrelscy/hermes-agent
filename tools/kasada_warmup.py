@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import urllib.parse
 import logging
 import urllib.request
 
@@ -155,6 +156,13 @@ async def verify_mint(
             logger.info("kasada_warmup: verify +%ds solved=%s l=%d k=%s title=%r kp=%s",
                         t, solved, last["len"], last["k"], last["title"][:40], bool(kp))
             if solved:
+                return last
+            # The thread navigated the tab elsewhere during the mint (it got
+            # the CDP URL before the mint finished). Nothing more will solve
+            # here; bail so ensure_warm can re-mint instead of polling ~90s.
+            _u = str(d.get("u", "") or "")
+            if _u.startswith("http") and apex not in (urllib.parse.urlparse(_u).hostname or ""):
+                logger.info("kasada_warmup: page left %s (now %s); abandoning verify", apex, _u[:80])
                 return last
         except Exception as e:
             logger.debug("kasada_warmup: verify +%ds err %s", t, repr(e)[:80])

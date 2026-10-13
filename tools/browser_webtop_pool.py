@@ -515,34 +515,76 @@ done
 #     desktop window-size lets xfwm4 add a title bar -> outer > inner.
 #   --password-store=basic : avoid a gnome-keyring prompt on the session.
 # Prefer the sandbox: dropping --no-sandbox is itself an automation signal.
-# If the container lacks unprivileged user namespaces chrome dies at once;
-# detect that and relaunch permissively so the browser always comes up.
-"$BROWSER" --window-size=2556,1398 --remote-debugging-port=9222 \\
-  --remote-debugging-address=0.0.0.0 --remote-allow-origins=* \\
-  --user-data-dir="$UDD" --no-first-run --no-default-browser-check \\
-  --lang=en-AU --accept-lang=en-AU,en \\
-  --disable-blink-features=AutomationControlled \\
-  --disable-features=AutomationControlled \\
-  --password-store=basic \\
-  --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader-webgl \\
-  --in-process-gpu --disable-gpu-sandbox \\
-  --disable-session-crashed-bubble --restore-last-session=false $STARTUP_URL \\
-  >/config/browser.log 2>&1 &
-PID=$!
-sleep 5
-if kill -0 "$PID" 2>/dev/null; then
-  wait "$PID"
-else
-  exec "$BROWSER" --no-sandbox --window-size=2556,1398 --remote-debugging-port=9222 \\
+# Without unprivileged user namespaces the sandboxed chrome hits a FATAL
+# namespace error, but its crashpad/zygote children can linger long enough
+# that a bare "is the PID alive" check passes and the script waits on a
+# browser that never opens 9222 (observed 2026-10-13). So: probe userns up
+# front, and gate on the CDP endpoint answering rather than the PID.
+cdp_up() {
+  curl -fsS -m 2 http://127.0.0.1:9222/json/version >/dev/null 2>&1
+}
+log() {
+  echo "$(date '+%F %T') chromium-cdp.sh: $*" >>/config/browser.log
+}
+launch() {
+  # $1: extra sandbox flag ("" or --no-sandbox)
+  "$BROWSER" $1 --window-size=2556,1398 --remote-debugging-port=9222 \\
     --remote-debugging-address=0.0.0.0 --remote-allow-origins=* \\
     --user-data-dir="$UDD" --no-first-run --no-default-browser-check \\
+    --lang=en-AU --accept-lang=en-AU,en \\
     --disable-blink-features=AutomationControlled \\
     --disable-features=AutomationControlled \\
     --password-store=basic \\
     --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader-webgl \\
     --in-process-gpu --disable-gpu-sandbox \\
-    --disable-session-crashed-bubble --restore-last-session=false $STARTUP_URL
+    --disable-session-crashed-bubble --restore-last-session=false $STARTUP_URL \\
+    >>/config/browser.log 2>&1 &
+  PID=$!
+}
+wait_cdp() {
+  # $1: seconds. Returns 0 once 9222 answers, 1 on timeout or chrome exit.
+  i=0
+  while [ "$i" -lt "$1" ]; do
+    cdp_up && return 0
+    kill -0 "$PID" 2>/dev/null || return 1
+    sleep 1
+    i=$((i + 1))
+  done
+  cdp_up
+}
+kill_chrome() {
+  kill -9 "$PID" 2>/dev/null
+  pkill -9 -u "$(id -u)" -f "user-data-dir=$UDD" 2>/dev/null
+  sleep 1
+  rm -f "$UDD/SingletonLock" "$UDD/SingletonCookie" "$UDD/SingletonSocket"
+}
+
+# A chrome already serving 9222 owns the profile; a second launch would only
+# hand off to it and exit. Leave it alone.
+if cdp_up; then
+  log "CDP already up on 9222; not launching another chrome"
+  exit 0
 fi
+
+SANDBOX=""
+if [ -n "$HERMES_CHROME_NO_SANDBOX" ] || ! unshare -Ur true >/dev/null 2>&1; then
+  SANDBOX="--no-sandbox"
+  log "no unprivileged user namespaces; launching with --no-sandbox"
+fi
+log "launching chrome ${SANDBOX:-(sandboxed)} url=${STARTUP_URL:-about:blank}"
+launch "$SANDBOX"
+if ! wait_cdp 20; then
+  log "CDP not up 20s after launch; relaunching with --no-sandbox"
+  kill_chrome
+  launch --no-sandbox
+  if ! wait_cdp 30; then
+    log "CDP still not up after --no-sandbox relaunch; giving up (pool will retry)"
+    kill_chrome
+    exit 1
+  fi
+fi
+log "CDP up on 9222 (pid $PID)"
+wait "$PID"
 """
 
 _CHROMIUM_DESKTOP = """[Desktop Entry]
@@ -682,6 +724,25 @@ def _used_host_ports() -> set:
     except Exception:
         pass
     return ports
+
+
+def _published_ports(container: str):
+    """(cdp_port, novnc_port) host ports a running container actually has
+    published, or None if they can't be read."""
+    try:
+        r = _run(["docker", "port", container], timeout=10, check=False)
+        found = {}
+        for line in r.stdout.splitlines():
+            # "9223/tcp -> 127.0.0.1:9222"
+            if "->" not in line:
+                continue
+            cport, host = (x.strip() for x in line.split("->", 1))
+            found[cport.split("/", 1)[0]] = int(host.rsplit(":", 1)[1])
+        if "9223" in found and "3000" in found:
+            return found["9223"], found["3000"]
+    except Exception:
+        pass
+    return None
 
 
 def _pick_port(base: int, size: int, used: set, reserved: set) -> int:
@@ -1174,15 +1235,26 @@ def _ensure_running(task_id: str) -> Dict:
         already_running = bool(entry.get("running")) and _container_running(entry["container"])
         if not already_running:
             entry["running"] = False
+            # A reaped/evicted/crashed container may have lost its host ports
+            # to another task while it was down; pick fresh ones if so.
+            ports = {entry.get("cdp_port"), entry.get("novnc_port")}
+            if None not in ports and not _container_running(entry["container"]) \
+                    and ports & _used_host_ports():
+                entry["cdp_port"] = None
+                entry["novnc_port"] = None
             if not entry.get("cdp_port"):
                 _evict_lru()
                 _reserve_ports(entry)  # atomic under _LOCK; stamps entry ports
     if already_running:
+        _ensure_cdp_healthy(entry)
         return entry
     # Cold-boot OUTSIDE _LOCK, serialized per-container.
     with _warm_lock(entry["container"]):
         if _container_running(entry["container"]):
+            actual = _published_ports(entry["container"])
             with _LOCK:
+                if actual:
+                    entry["cdp_port"], entry["novnc_port"] = actual
                 entry["running"] = True
                 _save_state()
         else:
@@ -1190,7 +1262,8 @@ def _ensure_running(task_id: str) -> Dict:
             with _LOCK:
                 entry["running"] = True
                 _save_state()
-    _wait_desktop_ready(entry)
+    if not _wait_desktop_ready(entry):
+        _ensure_cdp_healthy(entry, grace=0.0)
     return entry
 
 
@@ -1510,15 +1583,141 @@ _KASADA_SENSOR_WINDOW = float(os.environ.get("HERMES_WEBTOP_POOL_KASADA_SENSOR_W
 def _kill_chrome(container: str) -> None:
     """Stop the in-container chrome (launched to about:blank or a prior startup
     URL) so _launch_chrome can relaunch with a new startup URL. Clears stale
-    singleton locks so the relaunch doesn't refuse."""
+    singleton locks so the relaunch doesn't refuse.
+
+    The [x] in each pattern stops pkill matching this bash -c command line.
+    Also kills any chrome on another debugging port and any socat relays: when
+    9222 failed to come up the agent has improvised its own chrome on 9223,
+    which steals cdp-forward.py's listen port and shares the profile lock."""
     try:
         _run(["docker", "exec", container, "bash", "-lc",
-              "pkill -9 -f remote-debugging-port=9222 2>/dev/null; sleep 1; "
+              "pkill -9 -f 'chromium-cd[p].sh' 2>/dev/null; "
+              "pkill -9 -f 'remote-debugging-por[t]=' 2>/dev/null; "
+              "pkill -9 -f 'user-data-dir=/config/.config/chrome-herme[s]' 2>/dev/null; "
+              "pkill -9 -x socat 2>/dev/null; sleep 1; "
               "rm -rf /config/.config/chrome-hermes/SingletonLock "
               "/config/.config/chrome-hermes/SingletonCookie "
               "/config/.config/chrome-hermes/SingletonSocket 2>/dev/null"], timeout=15)
     except Exception as e:
         logger.debug("webtop pool: kill chrome in %s: %s", container, e)
+
+
+def _ensure_cdp_forward(container: str) -> None:
+    """Make sure cdp-forward.py (0.0.0.0:9223 -> 127.0.0.1:9222) is running.
+
+    It's started once by the XFCE autostart; if 9223 was taken at that moment
+    (a stray chrome) it dies on bind and nothing restarts it, so the host port
+    maps to nothing even when chrome is fine."""
+    try:
+        r = _run(["docker", "exec", container, "sh", "-c",
+                  "pgrep -f '/config/bin/cdp-forwar[d].py' >/dev/null"],
+                 timeout=10, check=False)
+        if r.returncode == 0:
+            return
+        logger.warning("webtop pool: cdp-forward not running in %s; starting it", container)
+        _run(["docker", "exec", "-d", "-u", "1000", container, "sh", "-c",
+              "exec python3 /config/bin/cdp-forward.py >>/config/cdp-forward.log 2>&1"],
+             timeout=10)
+    except Exception as e:
+        logger.warning("webtop pool: ensure cdp-forward in %s failed: %s", container, e)
+
+
+def _cdp_inside_up(container: str) -> bool:
+    """True if chrome answers on 127.0.0.1:9222 inside the container."""
+    try:
+        r = _run(["docker", "exec", container, "sh", "-c",
+                  "curl -fsS -m 2 http://127.0.0.1:9222/json/version >/dev/null"],
+                 timeout=10, check=False)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+_REPAIR_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def _ensure_cdp_healthy(entry: Dict, grace: float = 20.0, attempts: int = 2) -> bool:
+    try:
+        return _repair_cdp(entry, grace, attempts)
+    except Exception as e:
+        logger.warning("webtop pool: CDP health check for %s failed: %s", entry.get("container"), e)
+        return False
+
+
+def _repair_cdp(entry: Dict, grace: float, attempts: int) -> bool:
+    """Check the task's CDP endpoint end to end and repair it if dead.
+
+    Host port answering -> healthy. Otherwise: restart cdp-forward if it's gone;
+    give a booting chrome ``grace`` seconds; then kill every chrome/relay in the
+    container and relaunch via chromium-cdp.sh, up to ``attempts`` times.
+    Only plain HTTP GETs to /json/version are used, which don't disturb a
+    Kasada sensor window. Returns True when the host port answers.
+    """
+    port = entry.get("cdp_port")
+    name = entry.get("container")
+    if not port or not name:
+        return False
+    if _wait_cdp_http(int(port), timeout=2.0):
+        return True
+    with _REPAIR_LOCKS.setdefault(name, threading.Lock()):
+        if _wait_cdp_http(int(port), timeout=2.0):
+            return True
+        # Containers outlive gateway restarts; refresh the seed scripts so the
+        # relaunch below uses the current chromium-cdp.sh.
+        try:
+            _ensure_seed(Path(entry["config_dir"]))
+        except Exception as e:
+            logger.debug("webtop pool: reseed %s: %s", name, e)
+        _ensure_cdp_forward(name)
+        # Only wait out the grace period if a chrome is actually starting.
+        booting = _run(["docker", "exec", name, "sh", "-c",
+                        "pgrep -f 'remote-debugging-port=922[2]' >/dev/null"],
+                       timeout=10, check=False).returncode == 0
+        if booting and _wait_cdp_http(int(port), timeout=grace):
+            return True
+        for attempt in range(1, attempts + 1):
+            logger.warning("webtop pool: CDP dead in %s (host port %s); relaunching chrome (attempt %d/%d)",
+                           name, port, attempt, attempts)
+            _kill_chrome(name)
+            _ensure_cdp_forward(name)
+            _launch_chrome(name)
+            if _wait_cdp_http(int(port), timeout=60.0):
+                logger.info("webtop pool: CDP restored in %s", name)
+                return True
+            if _cdp_inside_up(name):
+                # Chrome is fine; the forwarder is the broken hop.
+                _run(["docker", "exec", name, "sh", "-c",
+                      "pkill -f '/config/bin/cdp-forwar[d].py'"], timeout=10, check=False)
+                _ensure_cdp_forward(name)
+                if _wait_cdp_http(int(port), timeout=5.0):
+                    return True
+        logger.error("webtop pool: CDP still dead in %s after %d relaunches", name, attempts)
+        return False
+
+
+def _hold_sensor_window(port: int, domain: str) -> bool:
+    """Sleep out the no-CDP sensor window, polling /json/list (plain HTTP,
+    no WS attach) to see whether the tab is still on ``domain``. Returns
+    False early if the thread has navigated every page elsewhere, since the
+    mint can't solve then."""
+    import urllib.parse
+    import urllib.request
+    apex = domain.lower().lstrip(".")
+    if apex.startswith("www."):
+        apex = apex[4:]
+    deadline = time.time() + _KASADA_SENSOR_WINDOW
+    while time.time() < deadline:
+        time.sleep(min(2.0, max(0.0, deadline - time.time())))
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as resp:
+                targets = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            continue
+        urls = [str(t.get("url", "")) for t in targets if t.get("type") == "page"]
+        web = [u for u in urls if u.startswith("http")]
+        if web and not any(apex in (urllib.parse.urlparse(u).hostname or "") for u in web):
+            return False
+    return True
 
 
 def _prewarm_kasada(entry: Dict, domain: str, timeout: float = 120.0,
@@ -1557,7 +1756,10 @@ def _prewarm_kasada(entry: Dict, domain: str, timeout: float = 120.0,
         if not _wait_cdp_http(int(port), timeout=60.0):
             logger.warning("webtop pool: prewarm CDP not ready for %s; skipping mint", name)
             return is_warm(entry, domain)
-        time.sleep(_KASADA_SENSOR_WINDOW)
+        if not _hold_sensor_window(int(port), domain):
+            logger.info("webtop pool: tab left %s during the sensor window in %s; "
+                        "abandoning this mint", domain, name)
+            return is_warm(entry, domain)
         # Verify through a direct in-container forwarder (0.0.0.0:9298 -> 9222):
         # cdp-forward.py is select-based and can drop the WS under event bursts.
         direct_url, cleanup = _direct_cdp_url(entry)
