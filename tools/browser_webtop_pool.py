@@ -1129,6 +1129,21 @@ def _create_container(entry: Dict) -> None:
                          daemon=True).start()
 
 
+def _sync_logins(entry: Dict, force: bool = False) -> None:
+    """Sync shared Slack/Microsoft/Google login cookies with this webtop's
+    Chrome (see tools/webtop_shared_logins.py). Best-effort, never raises."""
+    if not entry.get("running") or not entry.get("cdp_port"):
+        return
+    try:
+        try:
+            from . import webtop_shared_logins as m  # type: ignore
+        except ImportError:
+            import webtop_shared_logins as m  # type: ignore
+        m.sync(entry.get("container"), entry.get("cdp_port"), force=force)
+    except Exception as e:
+        logger.debug("webtop pool: login sync for %s failed: %s", entry.get("container"), e)
+
+
 def _stop_and_remove(entry: Dict, remove: bool = True) -> None:
     """docker stop (+ rm) a container, KEEPING its /config volume.
 
@@ -1139,6 +1154,8 @@ def _stop_and_remove(entry: Dict, remove: bool = True) -> None:
     teardown never wedges the caller.
     """
     name = entry.get("container")
+    # Keep any login made since the last sync before the browser goes away.
+    _sync_logins(entry, force=True)
     if name:
         try:
             _run(["docker", "stop", name], timeout=40, check=False)
@@ -1284,6 +1301,7 @@ def get_cdp_url(task_id: Optional[str]) -> str:
         port = entry.get("cdp_port")
         if not port:
             return ""
+        _sync_logins(entry)
         return f"http://127.0.0.1:{port}"
     except Exception as e:
         logger.warning("webtop pool: get_cdp_url(%s) failed: %s", task_id, e)
@@ -1298,6 +1316,7 @@ def get_container_name(task_id: Optional[str]) -> Optional[str]:
         task_id = "default"
     try:
         entry = _ensure_running(task_id)
+        _sync_logins(entry)
         return entry.get("container")
     except Exception as e:
         logger.warning("webtop pool: get_container_name(%s) failed: %s", task_id, e)
@@ -1404,6 +1423,11 @@ def delete_task(task_id: Optional[str]) -> bool:
         _stop_and_remove(entry, remove=True)
         if cfg:
             _purge_volume(cfg)
+        try:
+            from . import webtop_shared_logins as m  # type: ignore
+            m.forget(name)
+        except Exception:
+            pass
         _save_state()
         logger.info("webtop pool: deleted task %s (container %s + volume purged)",
                     task_id, name)
