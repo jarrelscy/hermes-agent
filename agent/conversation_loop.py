@@ -601,6 +601,13 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    # Which webtop belongs to this thread. Computed once per turn so the
+    # current user message stays byte-stable across the turn's API calls.
+    try:
+        from tools.browser_webtop_pool import describe_task_webtop
+        _webtop_note = describe_task_webtop(effective_task_id)
+    except Exception:
+        _webtop_note = ""
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -806,6 +813,8 @@ def run_conversation(
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
+                if _webtop_note:
+                    _injections.append(_webtop_note)
                 if _injections:
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):

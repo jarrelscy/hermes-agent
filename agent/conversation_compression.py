@@ -832,6 +832,15 @@ def compress_context(
                         agent._session_db_created = True
                         raise
                     agent._session_db_created = True
+                    # Copy the gateway routing peer (session_key/chat/thread) onto
+                    # the child now. The gateway only records it when the turn
+                    # finishes, so a gateway crash mid-turn otherwise leaves the
+                    # live child unkeyed and the startup prune drops the thread's
+                    # mapping instead of repointing it to the child.
+                    try:
+                        agent._session_db.copy_gateway_session_peer(old_session_id, agent.session_id)
+                    except Exception as _peer_err:
+                        logger.debug("Could not copy gateway peer on compression: %s", _peer_err)
                     # Carry a persistent /goal onto the continuation session.
                     # Compression mints a fresh child id; load_goal does a flat
                     # per-session lookup with no parent walk, so without this an

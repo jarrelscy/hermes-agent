@@ -37,6 +37,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -2270,6 +2271,36 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # Hard-block: docker exec / CDP into a webtop that belongs to another
+        # thread. Compaction summaries can carry a sibling thread's container
+        # name or port, and acting on it hijacks that thread's browser.
+        _webtop_owner_ids = (task_id, session_id)
+        try:
+            from tools.browser_webtop_pool import foreign_webtop_refs, peek_entry
+            _foreign = foreign_webtop_refs(command, _webtop_owner_ids)
+        except Exception as _e:
+            logger.debug("webtop ownership check skipped: %s", _e)
+            _foreign = []
+        if _foreign:
+            _own = peek_entry(task_id) or peek_entry(session_id) or {}
+            if _own.get("container"):
+                _own_desc = f"Your thread's webtop is {_own['container']}"
+                if _own.get("running") and _own.get("cdp_port"):
+                    _own_desc += f" (CDP http://127.0.0.1:{_own['cdp_port']})"
+            else:
+                _own_desc = ("This thread has no webtop yet; call a browser "
+                             "tool to start one")
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    f"Blocked: {', '.join(_foreign)} belongs to another thread's "
+                    f"webtop. {_own_desc}. Use $HERMES_WEBTOP_CONTAINER and "
+                    "$HERMES_WEBTOP_CDP_URL instead of hard-coded names or ports."
+                ),
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
@@ -2356,6 +2387,21 @@ def terminal_tool(
             env.cwd_owner = session_key
         except Exception:
             pass
+
+        # The env is shared across sessions, so export this thread's webtop
+        # per command rather than on env.env.
+        try:
+            from tools.browser_webtop_pool import peek_entry
+            _wt = peek_entry(task_id) or peek_entry(session_id)
+        except Exception:
+            _wt = None
+        if _wt and _wt.get("container"):
+            _wt_cdp = (f"http://127.0.0.1:{_wt['cdp_port']}"
+                       if _wt.get("running") and _wt.get("cdp_port") else "")
+            command = (
+                f"export HERMES_WEBTOP_CONTAINER={shlex.quote(_wt['container'])} "
+                f"HERMES_WEBTOP_CDP_URL={shlex.quote(_wt_cdp)}; {command}"
+            )
 
         if background:
             # Spawn a tracked background process via the process registry.

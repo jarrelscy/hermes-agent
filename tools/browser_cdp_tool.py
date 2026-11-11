@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from tools.registry import registry, tool_error
@@ -96,18 +97,26 @@ def _run_async(coro):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_cdp_endpoint() -> str:
+def _resolve_cdp_endpoint(task_id: Optional[str] = None) -> str:
     """Return the normalized CDP WebSocket URL, or empty string if unavailable.
 
-    Delegates to ``tools.browser_tool._get_cdp_override`` so precedence stays
-    consistent with the rest of the browser tool surface:
+    With the webtop pool enabled this is the task's own webtop Chrome (the
+    global ``browser.cdp_url`` is vestigial there and points at another
+    thread's browser). Otherwise delegates to
+    ``tools.browser_tool._get_cdp_override`` so precedence stays consistent
+    with the rest of the browser tool surface:
 
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
     2. ``browser.cdp_url`` in ``config.yaml``
     """
     try:
-        from tools.browser_tool import _get_cdp_override  # type: ignore[import-not-found]
+        from tools.browser_tool import _get_cdp_override, _resolve_cdp_override  # type: ignore[import-not-found]
 
+        if not os.environ.get("BROWSER_CDP_URL", "").strip():
+            from tools.browser_webtop_pool import get_cdp_url, pool_enabled
+            if pool_enabled():
+                pool_url = get_cdp_url(task_id)
+                return _resolve_cdp_override(pool_url).strip() if pool_url else ""
         return (_get_cdp_override() or "").strip()
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("browser_cdp: failed to resolve CDP endpoint: %s", exc)
@@ -457,7 +466,7 @@ def browser_cdp(
             "Install it with: pip install websockets"
         )
 
-    endpoint = _resolve_cdp_endpoint()
+    endpoint = _resolve_cdp_endpoint(effective_task_id)
     if not endpoint:
         return tool_error(
             "No CDP endpoint is available. Run '/browser connect' to attach "

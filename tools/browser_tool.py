@@ -2098,11 +2098,22 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     # Falls back to the single global browser.cdp_url when the pool is off
     # (Phase 1 shared-desktop behaviour).
     cdp_override = ""
+    _pool_on = False
     try:
-        from tools.browser_webtop_pool import get_cdp_url as _pool_cdp_url
+        from tools.browser_webtop_pool import get_cdp_url as _pool_cdp_url, pool_enabled
+        _pool_on = pool_enabled()
         cdp_override = _pool_cdp_url(task_id) or ""
     except Exception as _e:  # module missing / docker unavailable
         logger.debug("webtop pool unavailable, using global cdp_url: %s", _e)
+    if not cdp_override and _pool_on and not force_local \
+            and not os.environ.get("BROWSER_CDP_URL", "").strip():
+        # Falling back to the shared browser.cdp_url would drive whatever
+        # listens there, possibly another thread's webtop.
+        raise RuntimeError(
+            "This thread's webtop container could not be started (pool full or "
+            "docker error). Retry shortly; do not connect to another thread's "
+            "webtop or a hard-coded CDP port."
+        )
     if not cdp_override:
         cdp_override = _get_cdp_override()
     if cdp_override and not force_local:

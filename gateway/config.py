@@ -1021,6 +1021,9 @@ def load_gateway_config() -> GatewayConfig:
             sr = yaml_cfg.get("session_reset")
             if sr and isinstance(sr, dict):
                 gw_data["default_reset_policy"] = sr
+            rbp = yaml_cfg.get("reset_by_platform")
+            if rbp and isinstance(rbp, dict):
+                gw_data["reset_by_platform"] = rbp
 
             qc = yaml_cfg.get("quick_commands")
             if qc is not None:

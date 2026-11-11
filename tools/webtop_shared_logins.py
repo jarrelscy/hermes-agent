@@ -140,7 +140,9 @@ class _Browser:
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{cdp_port}/json/version", timeout=timeout) as r:
             ws_url = json.loads(r.read())["webSocketDebuggerUrl"]
-        self._ws = connect(ws_url, max_size=None, open_timeout=timeout)
+        # The cdp-forward relay doesn't complete the close handshake; don't
+        # wait the default 10s for it on every sync.
+        self._ws = connect(ws_url, max_size=None, open_timeout=timeout, close_timeout=0.5)
         self._timeout = timeout
         self._id = 0
 

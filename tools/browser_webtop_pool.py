@@ -48,6 +48,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -122,6 +123,27 @@ def _image() -> str:
     # DEFAULT governs — same as _prewarm_on_start.
     _default = "lscr.io/linuxserver/webtop:ubuntu-xfce-kasm"
     return os.environ.get("HERMES_WEBTOP_POOL_IMAGE", _default).strip() or _default
+
+
+# Trust store with the eMudhra/emSign roots removed (CVE response, 2026-10).
+# The webtop image ships the roots and never refreshes them, so every new
+# container gets the cleaned bundle mounted over the system copy. Override the
+# path with HERMES_CA_BUNDLE; set it empty to skip the mount.
+_CA_BUNDLE_DEFAULT = "/home/jarrelscy/docker/ca-clean/ca-certificates.crt"
+
+
+def _ca_args() -> list:
+    raw = os.environ.get("HERMES_CA_BUNDLE", _CA_BUNDLE_DEFAULT).strip()
+    if not raw or not Path(raw).expanduser().is_file():
+        return []
+    bundle = str(Path(raw).expanduser())
+    return [
+        "-v", f"{bundle}:/etc/ca-clean/ca-certificates.crt:ro",
+        "-v", f"{bundle}:/etc/ssl/certs/ca-certificates.crt:ro",
+        "-e", "SSL_CERT_FILE=/etc/ca-clean/ca-certificates.crt",
+        "-e", "REQUESTS_CA_BUNDLE=/etc/ca-clean/ca-certificates.crt",
+        "-e", "CURL_CA_BUNDLE=/etc/ca-clean/ca-certificates.crt",
+    ]
 
 
 # ── Kasada prewarm config ───────────────────────────────────────────────────
@@ -205,39 +227,43 @@ def _slot_for(task_id: str) -> str:
 # ── seed files (identical to Phase 1; container-internal paths) ────────────
 
 _CDP_FORWARD_PY = """#!/usr/bin/env python3
-import socket, threading, select, sys
+import socket, threading, sys
 
 LISTEN = ("0.0.0.0", 9223)
 TARGET = ("127.0.0.1", 9222)
 
-def pipe(a, b):
+def pipe(src, dst):
+    # One thread per direction. Two readers on one socket would interleave
+    # chunks of large CDP messages (screenshots) and corrupt them.
     try:
         while True:
-            r, _, _ = select.select([a, b], [], [])
-            if a in r:
-                d = a.recv(65536)
-                if not d: break
-                b.sendall(d)
-            if b in r:
-                d = b.recv(65536)
-                if not d: break
-                a.sendall(d)
+            d = src.recv(65536)
+            if not d: break
+            dst.sendall(d)
     except Exception:
         pass
     finally:
-        try: a.close()
+        # Half-close so the other direction can finish (websocket close handshake).
+        try: dst.shutdown(socket.SHUT_WR)
         except: pass
-        try: b.close()
+        try: src.shutdown(socket.SHUT_RD)
         except: pass
 
 def handle(c):
     try:
         t = socket.create_connection(TARGET, timeout=5)
-        threading.Thread(target=pipe, args=(c, t), daemon=True).start()
-        threading.Thread(target=pipe, args=(t, c), daemon=True).start()
+        t.settimeout(None)
     except Exception as e:
         sys.stderr.write(f"cdp-forward connect failed: {e}\\n")
         c.close()
+        return
+    a = threading.Thread(target=pipe, args=(c, t), daemon=True)
+    b = threading.Thread(target=pipe, args=(t, c), daemon=True)
+    a.start(); b.start()
+    a.join(); b.join()
+    for x in (c, t):
+        try: x.close()
+        except: pass
 
 def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -536,7 +562,7 @@ launch() {
     --disable-features=AutomationControlled \\
     --password-store=basic \\
     --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader-webgl \\
-    --in-process-gpu --disable-gpu-sandbox \\
+    --disable-gpu-sandbox \\
     --disable-session-crashed-bubble --restore-last-session=false $STARTUP_URL \\
     >>/config/browser.log 2>&1 &
   PID=$!
@@ -859,6 +885,66 @@ def _ensure_cua_driver_in_container(container: str, config_dir: Path) -> None:
         logger.warning("webtop pool: ensure cua-driver in %s failed: %s", container, e)
 
 
+_XFWM4_XML_REL = ".config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
+
+
+def _seed_compositing(config_dir: Path) -> None:
+    """Turn on xfwm4 compositing in the profile before the desktop starts.
+
+    cua-driver always maps a fullscreen ARGB agent-cursor overlay (even with
+    agent_cursor_enabled=false, and even without start_session). Without a
+    compositor that window renders opaque black over the whole screen, so every
+    computer_use capture and the noVNC view show a black desktop.
+    """
+    p = config_dir / _XFWM4_XML_REL
+    try:
+        if p.exists():
+            txt = p.read_text()
+            if 'name="use_compositing" type="bool" value="true"' in txt:
+                return
+            if 'name="use_compositing"' in txt:
+                import re
+                txt = re.sub(r'(<property name="use_compositing" type="bool" value=")[^"]*"',
+                             r'\1true"', txt)
+            else:
+                txt = txt.replace('<property name="general" type="empty">',
+                                  '<property name="general" type="empty">\n'
+                                  '    <property name="use_compositing" type="bool" value="true"/>', 1)
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            txt = ('<?xml version="1.0" encoding="UTF-8"?>\n\n'
+                   '<channel name="xfwm4" version="1.0">\n'
+                   '  <property name="general" type="empty">\n'
+                   '    <property name="use_compositing" type="bool" value="true"/>\n'
+                   '  </property>\n</channel>\n')
+        p.write_text(txt)
+    except Exception as e:
+        logger.debug("webtop pool: seed compositing in %s failed: %s", config_dir, e)
+
+
+def _enable_compositing(container: str, timeout: float = 30.0) -> None:
+    """Turn on xfwm4 compositing in a running desktop (see _seed_compositing)."""
+    script = (
+        'P=$(pgrep -u 1000 -x xfwm4 | head -1); [ -n "$P" ] || exit 3; '
+        'export DBUS_SESSION_BUS_ADDRESS=$(tr "\\0" "\\n" < /proc/$P/environ '
+        '| grep ^DBUS_SESSION | cut -d= -f2-); '
+        'xfconf-query -c xfwm4 -p /general/use_compositing -s true'
+    )
+    deadline = time.time() + timeout
+    while True:
+        try:
+            r = _run(["docker", "exec", "-u", "1000", "-e", "DISPLAY=:1", container,
+                      "sh", "-c", script], timeout=15, check=False)
+            if r.returncode == 0:
+                return
+        except Exception:
+            pass
+        if time.time() > deadline:
+            logger.warning("webtop pool: could not enable compositing in %s", container)
+            return
+        time.sleep(2)
+
+
 def _files_same(a: str, b: str) -> bool:
     try:
         import hashlib
@@ -919,22 +1005,38 @@ def _save_state() -> None:
 
 # ── container lifecycle ────────────────────────────────────────────────────
 
+_CHROME_DEB_MAX_AGE = 7 * 86400
+
+
 def _host_chrome_deb() -> Optional[str]:
     """Path to a cached google-chrome .deb on the host; download once if absent."""
     cache = _config_root().parent / "pkgcache"
     deb = cache / "google-chrome-stable.deb"
-    if deb.is_file() and deb.stat().st_size > 1_000_000:
+    have = deb.is_file() and deb.stat().st_size > 1_000_000
+    # Refresh weekly so webtops don't stay pinned to the first Chrome we ever
+    # downloaded (sites start breaking on old majors). Keep the old .deb if
+    # the download fails.
+    if have and time.time() - deb.stat().st_mtime < _CHROME_DEB_MAX_AGE:
         return str(deb)
+    tmp = cache / "google-chrome-stable.deb.part"
     try:
         cache.mkdir(parents=True, exist_ok=True)
-        _run(["curl", "-fsSL", "-o", str(deb),
+        _run(["curl", "-fsSL", "-o", str(tmp),
               "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"],
              timeout=180)
-        if deb.is_file() and deb.stat().st_size > 1_000_000:
+        if tmp.is_file() and tmp.stat().st_size > 1_000_000:
+            os.replace(tmp, deb)
             return str(deb)
     except Exception as e:
         logger.warning("webtop pool: chrome deb download failed: %s", e)
-    return None
+    return str(deb) if have else None
+
+
+def _deb_version(deb: str) -> str:
+    try:
+        return _run(["dpkg-deb", "-f", deb, "Version"], timeout=30).stdout.strip()
+    except Exception:
+        return ""
 
 
 def _ensure_chrome_in_container(container: str) -> None:
@@ -947,20 +1049,32 @@ def _ensure_chrome_in_container(container: str) -> None:
     Best-effort: on failure the chromium-cdp seed falls back to chromium.
     """
     try:
-        try:
-            _run(["docker", "exec", container, "sh", "-c",
-                  "command -v google-chrome-stable"], timeout=10)
-            return  # already installed (survives docker restart)
-        except Exception:
-            pass
         deb = _host_chrome_deb()
+        installed = _run(["docker", "exec", container, "sh", "-c",
+                          "dpkg-query -W -f='${Version}' google-chrome-stable 2>/dev/null"],
+                         timeout=10, check=False).stdout.strip()
+        if installed:
+            want = _deb_version(deb) if deb else ""
+            if not want or _run(["dpkg", "--compare-versions", installed, "ge", want],
+                                timeout=10, check=False).returncode == 0:
+                return  # installed and current (survives docker restart)
+            logger.info("webtop pool: upgrading chrome in %s %s -> %s", container, installed, want)
         if not deb:
             logger.warning("webtop pool: no chrome deb; %s stays on chromium", container)
             return
         _run(["docker", "cp", deb, f"{container}:/tmp/chrome.deb"], timeout=60)
+        # Install without waiting on apt-get update: Chrome only lacks small
+        # deps (fonts-liberation, wget) in this image and runs without them,
+        # while a slow Ubuntu mirror can stall `apt-get update` for minutes.
+        # The deps are filled in afterwards in the background.
         _run(["docker", "exec", container, "bash", "-c",
-              "apt-get update -qq >/dev/null 2>&1; "
-              "apt-get install -y -qq /tmp/chrome.deb >/dev/null 2>&1"], timeout=180)
+              "dpkg -i --force-depends /tmp/chrome.deb >/dev/null 2>&1; "
+              "dpkg-query -W -f='${Status}' google-chrome-stable | grep -q ' installed'"],
+             timeout=120)
+        _run(["docker", "exec", "-d", container, "bash", "-c",
+              "timeout 900 apt-get update -qq >/dev/null 2>&1; "
+              "timeout 600 apt-get install -y -qq -f >/dev/null 2>&1"],
+             timeout=15, check=False)
     except Exception as e:
         logger.warning("webtop pool: ensure chrome in %s failed: %s", container, e)
 
@@ -1030,6 +1144,7 @@ def _create_container(entry: Dict) -> None:
     config_dir = Path(entry["config_dir"])
     config_dir.mkdir(parents=True, exist_ok=True)
     _ensure_seed(config_dir)
+    _seed_compositing(config_dir)
     # Remove a leftover stopped container of the same name (evicted but not rm'd).
     if _container_exists(name) and not _container_running(name):
         try:
@@ -1047,6 +1162,8 @@ def _create_container(entry: Dict) -> None:
         "-p", f"127.0.0.1:{cdp_port}:9223",
         "-p", f"127.0.0.1:{novnc_port}:3000",
         "-v", f"{config_dir}:/config",
+        # Cleaned CA bundle (no eMudhra/emSign roots) over the image's copy.
+        *_ca_args(),
         "-e", "PUID=1000",
         "-e", "PGID=1000",
         # Australia/Sydney matches the realestate.com.au audience; TZ is a
@@ -1079,6 +1196,7 @@ def _create_container(entry: Dict) -> None:
     # recreates — no re-copy needed on eviction/reactivation. The binary only
     # needs libX11/libXi/libXext which the webtop image already ships.
     _ensure_cua_driver_in_container(name, config_dir)
+    _enable_compositing(name)
     _ensure_chrome_in_container(name)
     # Kasada prewarm (eager, default ON): launch chrome with the first
     # configured domain as the STARTUP URL so its own initial navigation runs
@@ -1173,18 +1291,83 @@ def _stop_and_remove(entry: Dict, remove: bool = True) -> None:
     entry.pop("warm_domain", None)
 
 
-def _evict_lru() -> None:
-    """Stop + remove the least-recently-used running container (keep volume)."""
+def _running_container_names() -> set:
+    try:
+        r = _run(["docker", "ps", "--format", "{{.Names}}"], timeout=15)
+        return set(r.stdout.split())
+    except Exception:
+        return set()
+
+
+def _reconcile_stale(skip: Optional[Dict] = None) -> int:
+    """Drop ports held by entries whose container is no longer running.
+
+    MUST be called under ``_LOCK``. Containers released by another process
+    (CLI, dashboard) or removed by hand leave the in-memory entry still holding
+    its cdp/noVNC ports, and ``_reserve_ports`` then reports the pool exhausted
+    while those ports sit free. Entries mid-cold-boot (warm lock held) are left
+    alone. Returns how many entries were cleared.
+    """
+    alive = _running_container_names()
+    cleared = 0
+    for e in _MAPPING.values():
+        if e is skip or not (e.get("cdp_port") or e.get("novnc_port")):
+            continue
+        name = e.get("container")
+        if name in alive or _warm_lock(name).locked():
+            continue
+        e["running"] = False
+        e["cdp_port"] = None
+        e["novnc_port"] = None
+        e.pop("warm_expiry", None)
+        e.pop("warm_domain", None)
+        cleared += 1
+    if cleared:
+        logger.info("webtop pool: cleared stale ports on %d stopped entr%s",
+                    cleared, "y" if cleared == 1 else "ies")
+        _save_state()
+    return cleared
+
+
+def _reserve_ports_or_evict(entry: Dict):
+    """``_reserve_ports``, recovering from exhaustion. MUST hold ``_LOCK``.
+
+    On exhaustion: first clear stale entries, then evict the LRU running
+    container even if fewer than SIZE are tracked (untracked containers or
+    other services can hold ports in the range too).
+    """
+    try:
+        return _reserve_ports(entry)
+    except RuntimeError:
+        if _reconcile_stale(skip=entry):
+            try:
+                return _reserve_ports(entry)
+            except RuntimeError:
+                pass
+        if not _evict_lru(force=True, skip=entry):
+            raise
+        return _reserve_ports(entry)
+
+
+def _evict_lru(force: bool = False, skip: Optional[Dict] = None) -> bool:
+    """Stop + remove the least-recently-used running container (keep volume).
+
+    Without ``force`` this only evicts once SIZE tracked containers are
+    running. Returns True if something was evicted.
+    """
     size = _int_env("HERMES_WEBTOP_POOL_SIZE", 10)
-    running = [e for e in _MAPPING.values() if e.get("running")]
-    if len(running) < size:
-        return
+    running = [e for e in _MAPPING.values()
+               if e.get("running") and e is not skip
+               and not _warm_lock(e.get("container")).locked()]
+    if not running or (not force and len(running) < size):
+        return False
     running.sort(key=lambda e: e.get("last_used", 0))
     victim = running[0]
     name = victim.get("container")
     _stop_and_remove(victim, remove=True)
     logger.info("webtop pool: evicted %s (volume retained at %s)",
                 name, victim.get("config_dir"))
+    return True
 
 
 def _wait_desktop_ready(entry: Dict, timeout: float = 90.0) -> bool:
@@ -1220,6 +1403,45 @@ def _wait_desktop_ready(entry: Dict, timeout: float = 90.0) -> bool:
     return False
 
 
+def _session_ancestors(task_id: str, max_hops: int = 20) -> list:
+    """Earlier session ids of the same conversation, newest first.
+
+    Follows ``parent_session_id`` in state.db while each parent ended by
+    compression and has the same (or no recorded) gateway session_key, then
+    adds any other sessions with the same gateway session_key (a /new, an
+    auto-reset, or a mapping lost in a gateway crash), so a thread keeps one
+    webtop across session-id rotations. Empty on any failure.
+    """
+    try:
+        import sqlite3
+        from hermes_constants import get_hermes_home
+        db = sqlite3.connect(f"file:{get_hermes_home() / 'state.db'}?mode=ro", uri=True, timeout=2)
+        try:
+            row = db.execute("SELECT parent_session_id, session_key FROM sessions WHERE id=?",
+                             (task_id,)).fetchone()
+            if not row or not row[1]:
+                return []
+            parent, key = row
+            out = []
+            while parent and len(out) < max_hops and parent not in out:
+                r = db.execute("SELECT parent_session_id, session_key, end_reason FROM sessions "
+                               "WHERE id=?", (parent,)).fetchone()
+                if not r or r[1] not in (None, key) or r[2] != "compression":
+                    break
+                out.append(parent)
+                parent = r[0]
+            for (sid,) in db.execute("SELECT id FROM sessions WHERE session_key=? AND id<>? "
+                                     "ORDER BY started_at DESC LIMIT ?", (key, task_id, max_hops)):
+                if sid not in out:
+                    out.append(sid)
+            return out
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug("webtop pool: ancestor lookup for %s failed: %s", task_id, e)
+        return []
+
+
 def _ensure_running(task_id: str) -> Dict:
     """Return a mapping entry for task_id with a running container.
 
@@ -1234,8 +1456,20 @@ def _ensure_running(task_id: str) -> Dict:
     """
     _load_state()
     _start_reaper()
+    ancestors = [] if task_id in _MAPPING else _session_ancestors(task_id)
     with _LOCK:
         entry = _MAPPING.get(task_id)
+        if entry is None:
+            # Context compression continues a thread under a new session id;
+            # keep the thread on its existing webtop (tabs, logins, profile).
+            for anc in ancestors:
+                if anc in _MAPPING:
+                    entry = _MAPPING.pop(anc)
+                    _MAPPING[task_id] = entry
+                    _save_state()
+                    logger.info("webtop pool: %s inherits %s from earlier session %s",
+                                task_id, entry.get("container"), anc)
+                    break
         if entry is None:
             slot = _slot_for(task_id)
             entry = {
@@ -1261,7 +1495,7 @@ def _ensure_running(task_id: str) -> Dict:
                 entry["novnc_port"] = None
             if not entry.get("cdp_port"):
                 _evict_lru()
-                _reserve_ports(entry)  # atomic under _LOCK; stamps entry ports
+                _reserve_ports_or_evict(entry)  # atomic under _LOCK; stamps entry ports
     if already_running:
         _ensure_cdp_healthy(entry)
         return entry
@@ -1321,6 +1555,70 @@ def get_container_name(task_id: Optional[str]) -> Optional[str]:
     except Exception as e:
         logger.warning("webtop pool: get_container_name(%s) failed: %s", task_id, e)
         return None
+
+
+def peek_entry(task_id: Optional[str]) -> Optional[Dict]:
+    """Copy of a task's pool entry without waking or creating its container."""
+    if not pool_enabled() or not task_id:
+        return None
+    _load_state()
+    entry = _MAPPING.get(task_id)
+    return dict(entry) if entry else None
+
+
+def describe_task_webtop(task_id: Optional[str]) -> str:
+    """One-line note telling the agent which webtop belongs to its thread.
+
+    Injected into each turn so stale container names/ports from compaction
+    summaries or other threads don't get reused. Never wakes a container.
+    """
+    entry = peek_entry(task_id)
+    if not entry or not entry.get("container"):
+        return ""
+    name = entry["container"]
+    if entry.get("running") and entry.get("cdp_port"):
+        where = (f"Your thread's webtop is {name} (CDP http://127.0.0.1:"
+                 f"{entry['cdp_port']}, noVNC port {entry.get('novnc_port')}).")
+    else:
+        where = (f"Your thread's webtop is {name} (currently stopped; the "
+                 f"browser tools restart it and may assign new ports).")
+    return ("[Webtop] " + where + " The terminal exports it as "
+            "$HERMES_WEBTOP_CONTAINER / $HERMES_WEBTOP_CDP_URL. Other "
+            "hermes-wt-* containers and ports belong to other threads; "
+            "don't use them, even if earlier notes mention them.")
+
+
+_CONTAINER_RE = re.compile(r"hermes-wt-[0-9a-f]{12}")
+_LOCAL_PORT_RE = re.compile(r"(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(\d{4,5})")
+
+
+def foreign_webtop_refs(command: str, own_task_ids) -> list:
+    """Container names / host ports in ``command`` owned by other threads."""
+    if not pool_enabled() or not command:
+        return []
+    _load_state()
+    own = {t for t in own_task_ids if t}
+    own_names, foreign_names, foreign_ports = set(), {}, {}
+    for tid, e in list(_MAPPING.items()):
+        name = e.get("container")
+        if tid in own:
+            if name:
+                own_names.add(name)
+            continue
+        if name:
+            foreign_names[name] = tid
+        if e.get("running"):
+            for key in ("cdp_port", "novnc_port"):
+                if e.get(key):
+                    foreign_ports[int(e[key])] = tid
+    refs = []
+    for name in sorted(set(_CONTAINER_RE.findall(command))):
+        if name in foreign_names and name not in own_names:
+            refs.append(name)
+    for port in sorted({int(p) for p in _LOCAL_PORT_RE.findall(command)}):
+        if port in foreign_ports:
+            refs.append(f"127.0.0.1:{port}")
+    return refs
 
 
 def status() -> Dict:

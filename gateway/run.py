@@ -20920,9 +20920,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         name="gateway-housekeeping",
     )
     housekeeping_thread.start()
-    
+
+    # systemd watchdog pinged from this event loop, so a GIL-holding tool that
+    # freezes every platform gets the gateway killed (stacks dumped) and restarted.
+    from gateway.systemd_watchdog import enable_fault_dumps, run_watchdog
+    enable_fault_dumps(get_hermes_home() / "logs")
+    watchdog_task = asyncio.create_task(run_watchdog(), name="systemd-watchdog")
+
     # Wait for shutdown
     await runner.wait_for_shutdown()
+    watchdog_task.cancel()
 
     try:
         from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive

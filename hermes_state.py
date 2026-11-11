@@ -1715,6 +1715,35 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def copy_gateway_session_peer(self, from_session_id: str, to_session_id: str) -> None:
+        """Copy the gateway routing peer from one session row to another.
+
+        Used when compression rotates to a child session so the child is
+        findable by ``find_latest_gateway_session_for_peer`` straight away.
+        Only fills columns that are still NULL on the target.
+        """
+        if not from_session_id or not to_session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                       session_key = COALESCE(sessions.session_key, p.session_key),
+                       user_id = COALESCE(sessions.user_id, p.user_id),
+                       chat_id = COALESCE(sessions.chat_id, p.chat_id),
+                       chat_type = COALESCE(sessions.chat_type, p.chat_type),
+                       thread_id = COALESCE(sessions.thread_id, p.thread_id),
+                       display_name = COALESCE(sessions.display_name, p.display_name),
+                       origin_json = COALESCE(sessions.origin_json, p.origin_json)
+                   FROM (SELECT session_key, user_id, chat_id, chat_type, thread_id,
+                                display_name, origin_json
+                         FROM sessions WHERE id = ?) AS p
+                   WHERE sessions.id = ?""",
+                (from_session_id, to_session_id),
+            )
+
+        self._execute_write(_do)
+
     def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None:
         """Mark a gateway session's expiry-finalization flag in state.db.
 

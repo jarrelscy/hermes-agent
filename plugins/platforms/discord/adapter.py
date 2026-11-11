@@ -10,6 +10,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+import collections
 import hashlib
 import inspect
 import json
@@ -374,6 +375,7 @@ class VoiceReceiver:
 
         # Decryption
         self._secret_key: Optional[bytes] = None
+        self._raw_key = None
         self._dave_session = None
         self._bot_ssrc: int = 0
 
@@ -404,6 +406,13 @@ class VoiceReceiver:
         # buffers (Discord speaking flag held up by ambient sound) are dropped
         # without an STT call instead of completing every silence window.
         self._voiced_seen: Dict[int, bool] = {}
+        # Per-SSRC time of the last packet at/above the speech floor, and
+        # per-utterance packet loudness stats (logged on completion so the
+        # RMS floors can be tuned against real speech).
+        self._last_speech_ts: Dict[int, float] = {}
+        self._utt_stats: Dict[int, list] = {}
+        # Per-SSRC ring of recent (pcm, rms) frames kept while monitor-only.
+        self._preroll: Dict[int, "collections.deque"] = {}
 
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
@@ -435,6 +444,28 @@ class VoiceReceiver:
         self._speech_rms_threshold = max(
             1.0, float(cfg_voice.get("speech_rms_threshold") or 1200)
         )
+        # ``activity_rms_threshold``: lower floor that still counts as the
+        # user talking for end-of-utterance timing.  The speech floor alone
+        # cut sentences mid-clause whenever the speaker dropped below it for
+        # longer than the silence window (quiet words, trailing clauses).
+        self._activity_rms_threshold = max(
+            1.0,
+            float(
+                cfg_voice.get("activity_rms_threshold")
+                or self._speech_rms_threshold / 2
+            ),
+        )
+        # ``speech_tail_seconds``: after a speech-floor packet, keep the
+        # utterance open this long regardless of level (soft syllables).
+        self._speech_tail = max(
+            0.0, float(cfg_voice.get("speech_tail_seconds") or 0.35)
+        )
+        # ``barge_in.preroll_seconds``: audio kept from before a barge-in is
+        # detected and prepended to the utterance.
+        self._preroll_seconds = max(
+            0.0,
+            float(((cfg_voice.get("barge_in") or {}).get("preroll_seconds")) or 1.5),
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -443,6 +474,7 @@ class VoiceReceiver:
     def start(self):
         """Start listening for voice packets."""
         conn = self._vc._connection
+        self._raw_key = conn.secret_key
         self._secret_key = bytes(conn.secret_key)
         self._dave_session = conn.dave_session
         self._bot_ssrc = conn.ssrc
@@ -451,6 +483,32 @@ class VoiceReceiver:
         conn.add_socket_listener(self._on_packet)
         self._running = True
         logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
+
+    def _sync_session(self):
+        """Pick up a new key, DAVE session and SSRC after discord.py reconnects.
+
+        discord.py reconnects by itself on a voice websocket drop (often to a
+        new media server) without our watchdog noticing. The socket listener
+        survives but the old key no longer decrypts anything, so voice input
+        goes silently dead until the gateway restarts.
+        """
+        conn = self._vc._connection
+        key = conn.secret_key
+        if key is self._raw_key and conn.dave_session is self._dave_session:
+            return
+        try:
+            new_key = bytes(key)
+        except Exception:
+            return  # mid-handshake; keep the old values until the key lands
+        self._raw_key = key
+        self._secret_key = new_key
+        self._dave_session = conn.dave_session
+        self._bot_ssrc = conn.ssrc
+        with self._lock:
+            self._decoders.clear()
+        self._packet_debug_count = 0
+        logger.info("VoiceReceiver: voice session changed (reconnect); refreshed key (bot_ssrc=%d)",
+                    self._bot_ssrc)
 
     def stop(self):
         """Stop listening and clean up."""
@@ -465,6 +523,8 @@ class VoiceReceiver:
             self._decoders.clear()
             self._ssrc_to_user.clear()
             self._voiced_seen.clear()
+            self._last_speech_ts.clear()
+            self._utt_stats.clear()
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
@@ -477,27 +537,47 @@ class VoiceReceiver:
     # Barge-in (interrupt TTS by talking over it)
     # ------------------------------------------------------------------
 
-    def set_monitor_only(self, value: bool):
+    def set_monitor_only(self, value: bool, preroll: bool = False):
         """Toggle monitor-only mode.
 
         In monitor-only mode packets are decoded and their energy is tracked
         for barge-in, but the PCM is not buffered — so echo of the bot's own
         TTS never accumulates into a transcribable utterance.
         """
-        self._monitor_only = bool(value)
+        value = bool(value)
+        with self._lock:
+            if self._monitor_only and not value and preroll:
+                # Leaving monitor mode (barge-in): seed each buffer with the
+                # recent pre-roll so the start of the user's sentence, spoken
+                # before the barge-in was detected, isn't lost.
+                now = time.monotonic()
+                for ssrc, frames in self._preroll.items():
+                    if not frames:
+                        continue
+                    buf = self._buffers.setdefault(ssrc, bytearray())
+                    if buf:
+                        continue
+                    for pcm, rms in frames:
+                        buf.extend(pcm)
+                        self._utt_stats.setdefault(ssrc, []).append(rms)
+                        if rms >= self._speech_rms_threshold:
+                            self._voiced_seen[ssrc] = True
+                            self._last_speech_ts[ssrc] = now
+                    self._last_packet_time[ssrc] = now
+            self._preroll.clear()
+            self._monitor_only = value
 
     def reset_barge_state(self):
-        """Clear voiced-run tracking and any residual buffered audio.
+        """Clear voiced-run tracking and the barge-in pre-roll.
 
-        Called just before playback so a pre-existing buffer or a stale
-        voiced run can't be mistaken for a fresh barge-in.
+        Called just before playback so a stale voiced run can't be mistaken
+        for a fresh barge-in.  Buffered user speech is kept: clearing it here
+        dropped whatever the user said just before a reply started playing.
         """
         with self._lock:
             self._voiced_since.clear()
             self._last_voiced_ts.clear()
-            self._buffers.clear()
-            self._last_packet_time.clear()
-            self._voiced_seen.clear()
+            self._preroll.clear()
 
     @staticmethod
     def _frame_rms(pcm: bytes) -> float:
@@ -593,6 +673,7 @@ class VoiceReceiver:
     def _on_packet(self, data: bytes):
         if not self._running or self._paused:
             return
+        self._sync_session()
 
         # Log first few raw packets for debugging
         self._packet_debug_count += 1
@@ -733,10 +814,19 @@ class VoiceReceiver:
                         self._voiced_since[ssrc] = None
                 # In monitor-only mode we measure energy but discard the audio
                 # so echo of the bot's own TTS can't become a fake utterance.
-                if not self._monitor_only:
+                if self._monitor_only:
+                    ring = self._preroll.get(ssrc)
+                    if ring is None:
+                        ring = self._preroll[ssrc] = collections.deque(
+                            maxlen=max(1, int(self._preroll_seconds / 0.02))
+                        )
+                    ring.append((pcm, rms))
+                else:
                     self._buffers[ssrc].extend(pcm)
                     if rms >= self._speech_rms_threshold:
                         self._voiced_seen[ssrc] = True
+                        self._last_speech_ts[ssrc] = now
+                    self._utt_stats.setdefault(ssrc, []).append(rms)
                     # Noise-gated activity: only packets at/above the speech
                     # RMS floor refresh the end-of-utterance timer (plus a
                     # short tail window after voiced frames so trailing
@@ -744,9 +834,12 @@ class VoiceReceiver:
                     # Below-floor packets are buffered but never delay
                     # completion — road/ambient noise that keeps Discord's
                     # speaking flag up no longer stretches the silence wait.
+                    # Quieter speech above the activity floor still counts,
+                    # and the tail is measured from the last speech-floor
+                    # packet (was the higher barge-in floor).
                     if (
-                        rms >= self._speech_rms_threshold
-                        or (now - self._last_voiced_ts.get(ssrc, 0.0)) <= 0.25
+                        rms >= self._activity_rms_threshold
+                        or (now - self._last_speech_ts.get(ssrc, 0.0)) <= self._speech_tail
                         or ssrc not in self._last_packet_time
                     ):
                         self._last_packet_time[ssrc] = now
@@ -813,6 +906,7 @@ class VoiceReceiver:
                         # speaking flag up): drop silently, no STT call.
                         self._buffers[ssrc] = bytearray()
                         self._last_packet_time.pop(ssrc, None)
+                        self._utt_stats.pop(ssrc, None)
                         continue
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
@@ -821,6 +915,21 @@ class VoiceReceiver:
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
                         completed.append((user_id, bytes(buf)))
+                    st = self._utt_stats.pop(ssrc, None)
+                    if st:
+                        n = len(st)
+                        q = sorted(st)
+                        logger.info(
+                            "Voice utterance ssrc=%s %.1fs: %d pkts, %.0f%% >= speech %.0f, "
+                            "%.0f%% >= activity %.0f, rms p10/p25/p50/p90/max "
+                            "%.0f/%.0f/%.0f/%.0f/%.0f",
+                            ssrc, buf_duration, n,
+                            100 * sum(r >= self._speech_rms_threshold for r in st) / n,
+                            self._speech_rms_threshold,
+                            100 * sum(r >= self._activity_rms_threshold for r in st) / n,
+                            self._activity_rms_threshold,
+                            q[n // 10], q[n // 4], q[n // 2], q[(9 * n) // 10], q[-1],
+                        )
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
                 elif silence_duration >= self.silence_threshold * 2:
@@ -828,6 +937,7 @@ class VoiceReceiver:
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
                     self._voiced_seen.pop(ssrc, None)
+                    self._utt_stats.pop(ssrc, None)
 
         return completed
 
@@ -3002,15 +3112,47 @@ class DiscordAdapter(BasePlatformAdapter):
         if ambient:
             mixer.set_ambient(ambient)
 
+        if vc.is_playing():
+            vc.stop()
+        vc.play(mixer, after=self._mixer_after(guild_id))
+        self._voice_mixers[guild_id] = mixer
+        logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
+
+    @staticmethod
+    def _mixer_after(guild_id: int):
         def _after(error):
             if error:
                 logger.error("Voice mixer stream error (guild=%d): %s", guild_id, error)
+            else:
+                logger.warning("Voice mixer stream ended (guild=%d)", guild_id)
+        return _after
 
-        if vc.is_playing():
-            vc.stop()
-        vc.play(mixer, after=_after)
-        self._voice_mixers[guild_id] = mixer
-        logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
+    async def _ensure_mixer_playing(self, guild_id: int):
+        """Return the guild's mixer, reinstalling it if its player died.
+
+        discord.py's AudioPlayer gives up silently when a voice reconnect takes
+        longer than the client timeout, and cleans up (closes) the mixer. Speech
+        then never drains and every reply waits out PLAYBACK_TIMEOUT in silence.
+        """
+        mixer = self._voice_mixers.get(guild_id)
+        vc = self._voice_clients.get(guild_id)
+        if mixer is None or vc is None or not vc.is_connected():
+            return mixer
+        if not vc.is_playing() and not vc.is_paused():
+            logger.warning("Voice mixer player was dead (guild=%d); reinstalling", guild_id)
+            try:
+                await self._install_voice_mixer(guild_id, vc)
+            except Exception as e:
+                logger.warning("Voice mixer reinstall failed (guild=%d): %s", guild_id, e)
+            mixer = self._voice_mixers.get(guild_id)
+        return mixer
+        if not vc.is_playing() and not vc.is_paused():
+            logger.warning("Voice mixer player was dead (guild=%d); restarting playback", guild_id)
+            try:
+                vc.play(mixer, after=self._mixer_after(guild_id))
+            except Exception as e:
+                logger.warning("Voice mixer restart failed (guild=%d): %s", guild_id, e)
+        return mixer
 
     async def play_ack_in_voice(self, guild_id: int, phrase: Optional[str] = None) -> bool:
         """Speak a short acknowledgement over the ambient bed.
@@ -3021,7 +3163,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._voice_fx_cfg.get("ack_enabled"):
             return False
-        mixer = self._voice_mixers.get(guild_id)
+        mixer = await self._ensure_mixer_playing(guild_id)
         if mixer is None:
             return False
         if phrase is None:
@@ -3335,7 +3477,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         # ── Mixer path (overlap + ducking) ──────────────────────────────
-        mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
+        mixer = await self._ensure_mixer_playing(guild_id) if getattr(self, "_voice_mixers", None) else None
         if mixer is not None:
             try:
                 from voice_mixer import decode_to_pcm
@@ -3370,7 +3512,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                 and time.monotonic() >= not_before
                                 and receiver.barge_in_detected(min_ms, not_before)):
                             logger.info("Barge-in detected — stopping TTS playback (mixer)")
-                            receiver.set_monitor_only(False)  # capture the user's utterance
+                            receiver.set_monitor_only(False, preroll=True)  # capture the user's utterance
                             mixer.stop_speech()
                             break
                         await asyncio.sleep(0.05)
@@ -3430,7 +3572,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         and time.monotonic() >= not_before
                         and receiver.barge_in_detected(min_ms, not_before)):
                     logger.info("Barge-in detected — stopping TTS playback")
-                    receiver.set_monitor_only(False)  # capture the user's utterance
+                    receiver.set_monitor_only(False, preroll=True)  # capture the user's utterance
                     vc.stop()
                     break
                 await asyncio.sleep(0.05)

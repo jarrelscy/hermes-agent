@@ -3323,6 +3323,10 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Log every incoming update's routing fields (no content) so
+            # messages that match no handler, or never arrive, can be traced.
+            from telegram.ext import TypeHandler
+            self._app.add_handler(TypeHandler(Update, self._log_raw_update), group=-1)
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -7622,6 +7626,25 @@ class TelegramAdapter(BasePlatformAdapter):
         consuming channel posts without ever building a gateway event.
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
+
+    async def _log_raw_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            msg = self._effective_update_message(update)
+            kinds = [k for k in ("message", "edited_message", "channel_post", "callback_query",
+                                 "my_chat_member", "business_message")
+                     if getattr(update, k, None) is not None]
+            parts = [f"update_id={update.update_id}", f"kind={','.join(kinds) or 'other'}"]
+            if msg is not None:
+                parts += [
+                    f"chat={getattr(msg.chat, 'id', None)}",
+                    f"thread={getattr(msg, 'message_thread_id', None)}",
+                    f"topic_msg={bool(getattr(msg, 'is_topic_message', False))}",
+                    f"text={bool(msg.text)}",
+                    f"topic_created={bool(getattr(msg, 'forum_topic_created', None))}",
+                ]
+            logger.info("[Telegram] update %s", " ".join(parts))
+        except Exception:
+            logger.debug("raw update log failed", exc_info=True)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.

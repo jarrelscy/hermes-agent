@@ -255,15 +255,39 @@ tr:hover td{background:#161b22}
 footer{padding:12px 22px;color:#484f58;font-size:11px;border-top:1px solid #21262d}
 </style></head><body>
 <header><h1>Hermes webtops</h1>
-<span class="sub">{count} container(s) · auto-refresh 15s · idle-reap {ttl}m</span></header>
+<span class="sub">{count} container(s) · auto-refresh 15s · idle-reap {ttl}</span></header>
 <div class="wrap">{table}</div>
 <footer>Read-only view. Forwarded desktops: container bridge IP + HTTPS 3001 (fixed — not broken host:3311). Unauthenticated — trusted networks only.
 State file: {state}</footer>
 </body></html>"""
 
 # HTML renderer (uses .replace() instead of .format() to avoid CSS brace conflicts)
+def _gateway_idle_ttl() -> float:
+    """Idle-reap TTL as the gateway sees it (the pool runs in the gateway, not here).
+
+    Reads HERMES_WEBTOP_POOL_IDLE_TTL from the gateway unit's environment so the
+    header matches what the reaper actually does. Falls back to this process's
+    env, then to the pool's own default of 0 (reaping off).
+    """
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "hermes-gateway.service", "-p", "Environment", "--value"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        for kv in out.split():
+            if kv.startswith("HERMES_WEBTOP_POOL_IDLE_TTL="):
+                return float(kv.split("=", 1)[1])
+    except Exception:
+        pass
+    try:
+        return float(os.environ.get("HERMES_WEBTOP_POOL_IDLE_TTL", "0"))
+    except ValueError:
+        return 0.0
+
+
 def _render(rows: list, host: str) -> str:
-    ttl_val = int(float(os.environ.get("HERMES_WEBTOP_POOL_IDLE_TTL", "1800")) / 60)
+    _ttl = _gateway_idle_ttl()
+    ttl_val = f"{int(_ttl / 60)}m" if _ttl > 0 else "off"
     if not rows:
         table = '<div class="empty">No webtop containers in the pool state yet.</div>'
         result = _PAGE.replace("{count}", "0").replace("{ttl}", str(ttl_val)).replace("{table}", table).replace("{state}", html.escape(str(STATE_FILE)))
