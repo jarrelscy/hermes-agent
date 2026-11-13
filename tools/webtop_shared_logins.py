@@ -1,4 +1,4 @@
-"""Shared browser logins across webtops (Slack, Outlook/Microsoft, Google).
+"""Shared browser logins across webtops (Slack, Outlook/Microsoft, Google, Monash).
 
 Each thread has its own Chrome profile, so a login made in one thread is
 invisible to the next thread or cron run. This module keeps one shared cookie
@@ -47,6 +47,8 @@ _DEFAULT_DOMAINS = (
     "office.com", "office365.com", "outlook.com", "cloud.microsoft",
     # Google / Gmail (en-AU sign-in also sets cookies on google.com.au)
     "google.com", "google.com.au", "gmail.com",
+    # Monash (portal, Okta SSO, student site)
+    "monash.edu", "monashuni.okta.com", "student.monash",
 )
 
 _SYNC_INTERVAL = 30.0
