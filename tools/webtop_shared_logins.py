@@ -1,4 +1,5 @@
-"""Shared browser logins across webtops (Slack, Outlook/Microsoft, Google, Monash).
+"""Shared browser logins across webtops (Slack, Outlook/Microsoft, Google, Monash,
+plus any site added with the ``browser_share_login`` tool).
 
 Each thread has its own Chrome profile, so a login made in one thread is
 invisible to the next thread or cron run. This module keeps one shared cookie
@@ -20,6 +21,10 @@ Env:
   HERMES_WEBTOP_SHARED_LOGINS          1 (default) = enabled, 0 = off
   HERMES_WEBTOP_SHARED_LOGIN_DOMAINS   comma list, overrides the defaults
   HERMES_WEBTOP_SHARED_LOGIN_DIR       store dir (default ~/.hermes/browser-auth)
+
+Extra domains live in ``<store dir>/domains.json`` (a JSON list), re-read on
+every sync. The ``browser_share_login`` tool adds and removes them, so a new
+site can be shared without a code change or restart.
 
 The store holds live session cookies: it is written 0600 in a 0700 dir.
 """
@@ -61,11 +66,67 @@ def enabled() -> bool:
         "0", "false", "no", "off")
 
 
+# Too broad to share: a cookie scoped to one of these would leak every site.
+_PUBLIC_SUFFIXES = {
+    "com", "net", "org", "edu", "gov", "io", "co", "ai", "app", "dev", "au", "uk",
+    "nz", "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "co.nz", "github.io", "cloudfront.net",
+    "herokuapp.com", "vercel.app", "netlify.app", "pages.dev", "workers.dev",
+}
+
+
 def _domains() -> List[str]:
     raw = os.environ.get("HERMES_WEBTOP_SHARED_LOGIN_DOMAINS", "").strip()
     if raw:
         return [d.strip().lstrip(".").lower() for d in raw.split(",") if d.strip()]
-    return list(_DEFAULT_DOMAINS)
+    out = list(_DEFAULT_DOMAINS)
+    for d in extra_domains():
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def normalize_domain(domain: str) -> str:
+    """Bare lowercase host from a domain or URL; '' if unusable or too broad."""
+    d = (domain or "").strip().lower()
+    if "://" in d:
+        d = d.split("://", 1)[1]
+    d = d.split("/", 1)[0].split(":", 1)[0].strip(".")
+    if d.startswith("www."):
+        d = d[4:]
+    if "." not in d or d in _PUBLIC_SUFFIXES or not all(
+            p and all(ch.isalnum() or ch == "-" for ch in p) for p in d.split(".")):
+        return ""
+    return d
+
+
+def extra_domains() -> List[str]:
+    try:
+        data = json.loads((_store_dir() / "domains.json").read_text())
+    except (OSError, ValueError):
+        return []
+    return [d for d in data if isinstance(d, str)] if isinstance(data, list) else []
+
+
+def set_extra_domains(domains: List[str]) -> None:
+    d = _store_dir()
+    with _file_lock(d):
+        _write_json(d / "domains.json", sorted(set(domains)))
+
+
+def store_summary(domains: Optional[List[str]] = None) -> Dict[str, Dict]:
+    """Cookie names per domain in the store (no values), optionally filtered."""
+    store = _read_json(_store_dir() / "cookies.json")
+    now = time.time()
+    out: Dict[str, Dict] = {}
+    for c in store.values():
+        if _expired(c, now) or (domains and not _wanted(c, domains)):
+            continue
+        dom = out.setdefault(c.get("domain", ""), {"cookies": 0, "names": []})
+        dom["cookies"] += 1
+        if c.get("name") not in dom["names"]:
+            dom["names"].append(c.get("name"))
+    return out
 
 
 def _store_dir() -> Path:

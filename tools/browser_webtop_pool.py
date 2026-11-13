@@ -1248,8 +1248,8 @@ def _create_container(entry: Dict) -> None:
 
 
 def _sync_logins(entry: Dict, force: bool = False) -> None:
-    """Sync shared Slack/Microsoft/Google login cookies with this webtop's
-    Chrome (see tools/webtop_shared_logins.py). Best-effort, never raises."""
+    """Sync shared login cookies with this webtop's Chrome
+    (see tools/webtop_shared_logins.py). Best-effort, never raises."""
     if not entry.get("running") or not entry.get("cdp_port"):
         return
     try:
@@ -1260,6 +1260,31 @@ def _sync_logins(entry: Dict, force: bool = False) -> None:
         m.sync(entry.get("container"), entry.get("cdp_port"), force=force)
     except Exception as e:
         logger.debug("webtop pool: login sync for %s failed: %s", entry.get("container"), e)
+
+
+def sync_task_logins(task_id: Optional[str]) -> Optional[str]:
+    """Force a shared-login sync for the task's running webtop now.
+
+    Returns the container name, or None when the task has no running webtop.
+    """
+    if not pool_enabled():
+        return None
+    _load_state()
+    with _LOCK:
+        entry = dict(_MAPPING.get(task_id or "default") or {})
+    if not entry.get("running") or not entry.get("cdp_port"):
+        return None
+    _sync_logins(entry, force=True)
+    return entry.get("container")
+
+
+def _sync_running_logins_once() -> None:
+    """Sync shared logins for every running webtop, so a login made between
+    browser calls is kept even if the gateway dies before the next one."""
+    with _LOCK:
+        entries = [dict(e) for e in _MAPPING.values() if e.get("running")]
+    for e in entries:
+        _sync_logins(e, force=True)
 
 
 def _stop_and_remove(entry: Dict, remove: bool = True) -> None:
@@ -1750,27 +1775,36 @@ def _reap_idle_once() -> None:
             logger.warning("webtop pool: idle-reap %s failed: %s", tid, e)
 
 
+_LOGIN_SYNC_INTERVAL = 300.0
+
+
 def _reaper_loop() -> None:
+    last_login_sync = time.time()
     while True:
         try:
             time.sleep(60)
             _reap_idle_once()
+            if time.time() - last_login_sync >= _LOGIN_SYNC_INTERVAL:
+                last_login_sync = time.time()
+                _sync_running_logins_once()
         except Exception:
             time.sleep(60)
 
 
 def _start_reaper() -> None:
-    """Start the idle-reaper daemon thread once (lazy, on first pool use)."""
+    """Start the idle-reaper daemon thread once (lazy, on first pool use).
+
+    It also runs the periodic shared-login sync, so it starts even when idle
+    reaping is off (TTL <= 0 makes ``_reap_idle_once`` a no-op)."""
     global _REAPER_STARTED
-    if _IDLE_TTL <= 0:
-        return
     with _REAPER_LOCK:
         if _REAPER_STARTED:
             return
         _REAPER_STARTED = True
         threading.Thread(target=_reaper_loop, name="webtop-pool-reaper",
                          daemon=True).start()
-        logger.info("webtop pool: idle reaper started (TTL %ss)", int(_IDLE_TTL))
+        logger.info("webtop pool: reaper started (idle TTL %ss, login sync every %ss)",
+                    int(_IDLE_TTL), int(_LOGIN_SYNC_INTERVAL))
 
 # ── behavioural humanizer (Kasada) ──────────────────────────────────────────
 # Trusted CDP Input stream (mouse/scroll/key, isTrusted=true) run on the HOST
