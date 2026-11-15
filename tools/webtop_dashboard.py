@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LAN webtop dashboard — complete working version with fixed URL (bridge IP + HTTPS 3001)."""
 from __future__ import annotations
-import html, json, os, socket, subprocess, threading, time
+import base64, hmac, html, json, os, socket, subprocess, sys, threading, time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +31,10 @@ def _load_env(path: str) -> None:
         pass
 
 _load_env(os.path.expanduser("~/.hermes/.env"))
+
+# The desktop login lives in the pool module so both share one source.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tools.browser_webtop_pool import desktop_auth, ensure_desktop_auth  # noqa: E402
 
 # Bridge IP resolution (container -> IP via docker inspect, cached)
 def _bridge_ip(container: str) -> str | None:
@@ -87,6 +91,10 @@ def _serve_forwarder(lan_port: int) -> None:
         # the current container per connection instead of binding it once.
         container = _FWDS.get(lan_port)
         ip = _bridge_ip(container) if container else None
+        # Fail closed: only forward to a desktop that asks for the login.
+        if ip and not ensure_desktop_auth(container):
+            print(f"[fwd] {lan_port}: refusing, desktop login not enforced on {container}", flush=True)
+            ip = None
         if not ip:
             try:
                 client.close()
@@ -257,7 +265,7 @@ footer{padding:12px 22px;color:#484f58;font-size:11px;border-top:1px solid #2126
 <header><h1>Hermes webtops</h1>
 <span class="sub">{count} container(s) · auto-refresh 15s · idle-reap {ttl}</span></header>
 <div class="wrap">{table}</div>
-<footer>Read-only view. Forwarded desktops: container bridge IP + HTTPS 3001 (fixed — not broken host:3311). Unauthenticated — trusted networks only.
+<footer>Read-only view. Forwarded desktops: container bridge IP + HTTPS 3001 (fixed — not broken host:3311). Desktops and this page use the HERMES_WEBTOP_DESKTOP_USER / _PASSWORD login.
 State file: {state}</footer>
 </body></html>"""
 
@@ -336,7 +344,25 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args, **kwargs):
         pass
 
+    def _authorized(self) -> bool:
+        creds = desktop_auth()
+        if not creds:
+            return False
+        want = base64.b64encode(f"{creds[0]}:{creds[1]}".encode()).decode()
+        got = (self.headers.get("Authorization", "") or "")
+        return got.startswith("Basic ") and hmac.compare_digest(got[6:].strip(), want)
+
     def do_GET(self):
+        if not self._authorized():
+            body = (b"Login required." if desktop_auth() else
+                    b"Set HERMES_WEBTOP_DESKTOP_PASSWORD in ~/.hermes/.env to use the dashboard.")
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Hermes webtops"')
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         host_hdr = (self.headers.get("Host", "") or "").split(":")[0] or "127.0.0.1"
         path_normalized = self.path.rstrip("/")
         if path_normalized not in ("", "/"):

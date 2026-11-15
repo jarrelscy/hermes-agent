@@ -125,6 +125,105 @@ def _image() -> str:
     return os.environ.get("HERMES_WEBTOP_POOL_IMAGE", _default).strip() or _default
 
 
+# ── desktop login ────────────────────────────────────────────────────────────
+# The webtop's web desktop (ports 3000/3001 in the container, forwarded to the
+# LAN by tools/webtop_dashboard.py) has no login by default. The image turns on
+# nginx basic auth when CUSTOM_USER/PASSWORD are set at create. Containers made
+# before that, or whose nginx config was regenerated on restart, get the same
+# login written in by ensure_desktop_auth().
+_DESKTOP_AUTH_SCRIPT = r"""
+read -r U; read -r P
+f=/etc/nginx/sites-available/default; h=/etc/nginx/.htpasswd
+[ -f "$f" ] || exit 4
+changed=0
+cur=$(cat "$h" 2>/dev/null)
+salt=$(printf '%s' "$cur" | cut -d'$' -f3)
+want=""
+[ -n "$salt" ] && want="$U:$(printf '%s' "$P" | openssl passwd -apr1 -salt "$salt" -stdin)"
+if [ -z "$want" ] || [ "$cur" != "$want" ]; then
+  printf '%s:%s\n' "$U" "$(printf '%s' "$P" | openssl passwd -apr1 -stdin)" > "$h"
+  chmod 644 "$h"; changed=1
+fi
+if grep -q '#[[:space:]]*auth_basic' "$f"; then
+  sed -i 's/#\([[:space:]]*auth_basic\)/\1/' "$f"; changed=1
+fi
+grep -q '^[[:space:]]*auth_basic_user_file' "$f" || exit 3
+if [ $changed = 1 ]; then nginx -t >/dev/null 2>&1 && nginx -s reload || exit 5; fi
+exit 0
+"""
+
+
+def _hermes_env_file() -> Path:
+    home = os.environ.get("HERMES_HOME", "").strip()
+    return (Path(home).expanduser() if home else Path.home() / ".hermes") / ".env"
+
+
+def desktop_auth() -> Optional[tuple]:
+    """(user, password) for the webtop desktop login, or None when unset.
+
+    Read from HERMES_WEBTOP_DESKTOP_USER / HERMES_WEBTOP_DESKTOP_PASSWORD, in
+    the environment or else in ~/.hermes/.env (Hermes scrubs os.environ)."""
+    vals = {k: os.environ.get(k, "").strip() for k in
+            ("HERMES_WEBTOP_DESKTOP_USER", "HERMES_WEBTOP_DESKTOP_PASSWORD")}
+    if not vals["HERMES_WEBTOP_DESKTOP_PASSWORD"]:
+        try:
+            for line in _hermes_env_file().read_text(encoding="utf-8").splitlines():
+                k, sep, v = line.strip().partition("=")
+                if sep and k.strip() in vals and not vals[k.strip()]:
+                    vals[k.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+    pw = vals["HERMES_WEBTOP_DESKTOP_PASSWORD"]
+    if not pw:
+        return None
+    return (vals["HERMES_WEBTOP_DESKTOP_USER"] or "hermes", pw)
+
+
+def _desktop_auth_env_args() -> list:
+    creds = desktop_auth()
+    if not creds:
+        return []
+    return ["-e", f"CUSTOM_USER={creds[0]}", "-e", f"PASSWORD={creds[1]}"]
+
+
+_DESKTOP_AUTH_OK: Dict[str, float] = {}
+_DESKTOP_AUTH_RECHECK = 60.0
+
+
+def ensure_desktop_auth(container: str, force: bool = False) -> bool:
+    """Make the container's web desktop require the login. True when it does.
+
+    Idempotent; reloads nginx only when it changed something. The password goes
+    over stdin, so it never shows in host process arguments. A container that
+    passed is not checked again for a minute unless ``force``."""
+    creds = desktop_auth()
+    if not creds:
+        return False
+    if not force and time.time() - _DESKTOP_AUTH_OK.get(container, 0.0) < _DESKTOP_AUTH_RECHECK:
+        return True
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-i", "-u", "root", container, "bash", "-c", _DESKTOP_AUTH_SCRIPT],
+            input=f"{creds[0]}\n{creds[1]}\n", capture_output=True, text=True, timeout=20,
+        )
+    except Exception as e:
+        logger.warning("webtop pool: desktop login check failed on %s: %s", container, e)
+        return False
+    if r.returncode != 0:
+        logger.warning("webtop pool: desktop login not enforced on %s (exit %s)",
+                       container, r.returncode)
+        _DESKTOP_AUTH_OK.pop(container, None)
+        return False
+    _DESKTOP_AUTH_OK[container] = time.time()
+    return True
+
+
+def _ensure_desktop_auth_all() -> None:
+    for name in _running_container_names():
+        if name.startswith("hermes-wt-"):
+            ensure_desktop_auth(name, force=True)
+
+
 # Trust store with the eMudhra/emSign roots removed (CVE response, 2026-10).
 # The webtop image ships the roots and never refreshes them, so every new
 # container gets the cleaned bundle mounted over the system copy. Override the
@@ -1166,6 +1265,7 @@ def _create_container(entry: Dict) -> None:
         *_ca_args(),
         "-e", "PUID=1000",
         "-e", "PGID=1000",
+        *_desktop_auth_env_args(),
         # Australia/Sydney matches the realestate.com.au audience; TZ is a
         # scored Kasada signal (UTC is a server tell). LANG/LC set the session
         # locale so chrome --lang=en-AU resolves navigator.language natively.
@@ -1198,6 +1298,7 @@ def _create_container(entry: Dict) -> None:
     _ensure_cua_driver_in_container(name, config_dir)
     _enable_compositing(name)
     _ensure_chrome_in_container(name)
+    ensure_desktop_auth(name, force=True)
     # Kasada prewarm (eager, default ON): launch chrome with the first
     # configured domain as the STARTUP URL so its own initial navigation runs
     # the sensor undisturbed (no CDP WS client attached during the window) and
@@ -1523,6 +1624,7 @@ def _ensure_running(task_id: str) -> Dict:
                 _reserve_ports_or_evict(entry)  # atomic under _LOCK; stamps entry ports
     if already_running:
         _ensure_cdp_healthy(entry)
+        ensure_desktop_auth(entry["container"])
         return entry
     # Cold-boot OUTSIDE _LOCK, serialized per-container.
     with _warm_lock(entry["container"]):
@@ -1533,6 +1635,7 @@ def _ensure_running(task_id: str) -> Dict:
                     entry["cdp_port"], entry["novnc_port"] = actual
                 entry["running"] = True
                 _save_state()
+            ensure_desktop_auth(entry["container"])
         else:
             _create_container(entry)   # persists state itself (running=True + _save_state)
             with _LOCK:
@@ -1784,6 +1887,7 @@ def _reaper_loop() -> None:
         try:
             time.sleep(60)
             _reap_idle_once()
+            _ensure_desktop_auth_all()
             if time.time() - last_login_sync >= _LOGIN_SYNC_INTERVAL:
                 last_login_sync = time.time()
                 _sync_running_logins_once()
