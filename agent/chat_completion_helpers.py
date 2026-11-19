@@ -1508,7 +1508,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
         # the stale value from the previous model.  See #22387.
-        agent._config_context_length = None
+        # A context_length on the fallback entry itself still wins.
+        try:
+            agent._config_context_length = int(fb.get("context_length") or 0) or None
+        except (TypeError, ValueError):
+            agent._config_context_length = None
         agent.model = fb_model
         agent.provider = fb_provider
         agent.base_url = fb_base_url

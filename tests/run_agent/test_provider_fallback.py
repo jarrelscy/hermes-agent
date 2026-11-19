@@ -342,6 +342,27 @@ class TestFallbackChainDedup:
         assert ok is True
         assert called and called[0][:2] == ("custom", "local")
 
+    def test_fallback_entry_context_length_is_used(self):
+        """context_length on the fallback entry sets the compressor limit."""
+        fbs = [
+            {"provider": "custom", "model": "local",
+             "base_url": "http://192.168.0.128:8000/v1", "context_length": 131072},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "custom"
+        agent.model = "local"
+        agent.base_url = "http://127.0.0.1:8001/v1"
+        agent._config_context_length = 1048576
+        agent.context_compressor = MagicMock()
+
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                   side_effect=lambda provider, model=None, raw_codex=False, **kw: (_mock_client(), model)):
+            with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
+                assert agent._try_activate_fallback() is True
+
+        kwargs = agent.context_compressor.update_model.call_args.kwargs
+        assert kwargs["context_length"] == 131072
+
     def test_returns_false_when_only_self_matching_entries(self):
         """A chain with only self-matching entries exhausts to False."""
         fbs = [
