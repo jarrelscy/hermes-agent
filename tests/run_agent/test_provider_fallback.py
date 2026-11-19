@@ -319,6 +319,29 @@ class TestFallbackChainDedup:
             f"expected base_url-aware dedup, got call order: {called}"
         )
 
+    def test_same_custom_model_name_on_another_host_is_used(self):
+        """Two custom endpoints both serving "local" from different hosts are
+        different backends; the second host must be tried."""
+        fbs = [
+            {"provider": "custom", "model": "local",
+             "base_url": "http://192.168.0.128:8000/v1"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "custom"
+        agent.model = "local"
+        agent.base_url = "http://127.0.0.1:8001/v1"
+
+        called = []
+        def _resolve(provider, model=None, raw_codex=False, **kwargs):
+            called.append((provider, model, kwargs.get("explicit_base_url") or kwargs.get("base_url")))
+            return _mock_client(), model
+        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve):
+            with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
+                ok = agent._try_activate_fallback()
+
+        assert ok is True
+        assert called and called[0][:2] == ("custom", "local")
+
     def test_returns_false_when_only_self_matching_entries(self):
         """A chain with only self-matching entries exhausts to False."""
         fbs = [

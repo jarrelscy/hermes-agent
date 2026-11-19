@@ -1399,7 +1399,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     current_model = (getattr(agent, "model", "") or "").strip()
     current_base_url = str(getattr(agent, "base_url", "") or "").rstrip("/").lower()
     fb_base_url_for_dedup = (fb.get("base_url") or "").strip().rstrip("/").lower()
-    if fb_provider == current_provider and fb_model == current_model:
+    # Two custom endpoints can serve the same model name (e.g. "local") from
+    # different hosts; a different base_url is a different backend.
+    _different_host = bool(
+        fb_base_url_for_dedup and current_base_url
+        and fb_base_url_for_dedup != current_base_url
+    )
+    if fb_provider == current_provider and fb_model == current_model and not _different_host:
         logger.warning(
             "Fallback skip: chain entry %s/%s matches current provider/model",
             fb_provider, fb_model,
